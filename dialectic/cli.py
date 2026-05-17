@@ -310,11 +310,20 @@ def list_runs(repo_root: Path) -> None:
 @main.command()
 @click.option("--host", default="127.0.0.1")
 @click.option("--port", default=8765, type=int)
-def serve(host: str, port: int) -> None:
+@click.option(
+    "--token",
+    default=None,
+    help="Bearer token required on all requests. REQUIRED for non-loopback hosts.",
+)
+def serve(host: str, port: int, token: str | None) -> None:
     """Run the local HTTP API server."""
     from . import server
 
-    server.run(host=host, port=port)
+    try:
+        server.run(host=host, port=port, token=token)
+    except RuntimeError as exc:
+        console.print(f"[red]{exc}[/red]")
+        sys.exit(1)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

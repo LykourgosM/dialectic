@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import tempfile
 import uuid
 from collections import Counter
@@ -287,53 +288,75 @@ def _coerce_structured(raw: Any, model_cls: type) -> Any:
 
 def _classify_round_items(
     rounds: list[RevisionRound],
-) -> tuple[list[DisputedItem], list[AcknowledgedDissent], list[CritiqueItem]]:
-    """Walk all rounds; produce disputed, dissents, resolved from the final round's outcomes."""
-    if not rounds:
-        return [], [], []
-    final = rounds[-1]
-    critique = final.reviewer_critique
-    responses = final.writer_responses
-    rebuttal = final.reviewer_rebuttal
+) -> tuple[list[DisputedItem], list[AcknowledgedDissent], list[CritiqueItem], list[CritiqueItem]]:
+    """Walk all rounds; classify every critique item raised across the entire run.
 
+    Returns (disputed, dissents, resolved, unresolved). Walking ALL rounds (not just
+    the final one) is necessary so items resolved by the writer in earlier rounds
+    aren't lost from `resolved_items`.
+
+    Final-round-specific logic: if the reviewer raised items in the final round
+    but the writer never got to respond (REVISE verdict + max_revisions exhausted),
+    those items go to `unresolved` so the user can arbitrate them rather than
+    have them silently disappear.
+    """
     disputed: list[DisputedItem] = []
     dissents: list[AcknowledgedDissent] = []
     resolved: list[CritiqueItem] = []
+    unresolved: list[CritiqueItem] = []
 
-    if responses is None:
-        # No revision happened in the final round — either initial approve or aborted.
-        if critique.verdict == ReviewerVerdict.APPROVE:
-            resolved.extend(critique.items)
-        return disputed, dissents, resolved
+    if not rounds:
+        return disputed, dissents, resolved, unresolved
 
-    item_by_id = {item.id: item for item in critique.items}
-    response_by_id = {r.item_id: r for r in responses.responses}
-    rebuttal_by_id = (
-        {r.item_id: r for r in rebuttal.item_rebuttals} if rebuttal is not None else {}
-    )
+    for idx, round_obj in enumerate(rounds):
+        critique = round_obj.reviewer_critique
+        responses = round_obj.writer_responses
+        rebuttal = round_obj.reviewer_rebuttal
+        is_final = idx == len(rounds) - 1
 
-    for item in critique.items:
-        resp = response_by_id.get(item.id)
-        if resp is None:
-            resolved.append(item)
+        if responses is None:
+            # No writer response in this round.
+            if critique.verdict == ReviewerVerdict.APPROVE:
+                # Reviewer approved this round's diff — every item resolved trivially.
+                resolved.extend(critique.items)
+            elif is_final and critique.verdict == ReviewerVerdict.REVISE:
+                # REVISE-at-max_revisions: writer never got to respond. Items need user attention.
+                unresolved.extend(critique.items)
+            # For REJECT, items are documented in the rounds but don't go to any bucket
+            # (the run will be marked FAILED upstream).
             continue
-        if resp.action == WriterAction.ACCEPT:
-            resolved.append(item)
-            continue
-        rb = rebuttal_by_id.get(item.id)
-        if rb is None or rb.verdict == ItemRebuttalVerdict.ACCEPT_WRITER_RATIONALE:
-            dissents.append(AcknowledgedDissent(item=item, writer_response=resp))
-        else:
-            disputed.append(
-                DisputedItem(item=item, writer_response=resp, reviewer_rebuttal_item=rb)
-            )
-    return disputed, dissents, resolved
+
+        response_by_id = {r.item_id: r for r in responses.responses}
+        rebuttal_by_id = (
+            {r.item_id: r for r in rebuttal.item_rebuttals} if rebuttal is not None else {}
+        )
+
+        for item in critique.items:
+            resp = response_by_id.get(item.id)
+            if resp is None:
+                # Defensive: shouldn't happen because _validate_response_covers_critique runs first.
+                resolved.append(item)
+                continue
+            if resp.action == WriterAction.ACCEPT:
+                resolved.append(item)
+                continue
+            # Writer rejected. Look for rebuttal.
+            rb = rebuttal_by_id.get(item.id)
+            if rb is None or rb.verdict == ItemRebuttalVerdict.ACCEPT_WRITER_RATIONALE:
+                dissents.append(AcknowledgedDissent(item=item, writer_response=resp))
+            else:
+                disputed.append(
+                    DisputedItem(item=item, writer_response=resp, reviewer_rebuttal_item=rb)
+                )
+
+    return disputed, dissents, resolved, unresolved
 
 
 def _build_summary(
     rounds: list[RevisionRound],
     disputed: list[DisputedItem],
     dissents: list[AcknowledgedDissent],
+    unresolved: list[CritiqueItem],
 ) -> str:
     if not rounds:
         return "(no rounds executed)"
@@ -341,13 +364,17 @@ def _build_summary(
     if len(rounds) == 1 and first_verdict == ReviewerVerdict.APPROVE:
         return "Reviewer approved on first pass."
     total_items = sum(len(r.reviewer_critique.items) for r in rounds)
-    parts = [
-        f"{len(rounds)} round(s), {total_items} critique item(s) raised."
-    ]
+    parts = [f"{len(rounds)} round(s), {total_items} critique item(s) raised."]
     if dissents:
-        parts.append(f"{len(dissents)} acknowledged dissent(s) (writer defended, reviewer accepted).")
+        parts.append(
+            f"{len(dissents)} acknowledged dissent(s) (writer defended, reviewer accepted)."
+        )
     if disputed:
         parts.append(f"{len(disputed)} disputed item(s) requiring user arbitration.")
+    if unresolved:
+        parts.append(
+            f"{len(unresolved)} unresolved item(s) (max_revisions exhausted before writer could respond)."
+        )
     return " ".join(parts)
 
 
@@ -370,6 +397,22 @@ def _ensure_dialectic_dir(repo_root: Path) -> Path:
     return d
 
 
+_RUN_ID_RE = re.compile(r"^[0-9]{8}-[0-9]{6}-[0-9a-f]{6,}$")
+
+
+def _validate_run_id(run_id: str) -> None:
+    """Reject anything that isn't a well-formed run id.
+
+    Guards against path traversal: `run_id` is interpolated into a filesystem
+    path in load_run_record / persist_run_record / arbitrate. Without this check
+    a user-supplied id like '../../etc/passwd' would escape `.dialectic/runs/`.
+    """
+    if not isinstance(run_id, str) or not _RUN_ID_RE.match(run_id):
+        raise ValueError(
+            f"Invalid run_id {run_id!r}: expected YYYYMMDD-HHMMSS-<hex>"
+        )
+
+
 def _runs_dir(repo_root: Path) -> Path:
     d = _ensure_dialectic_dir(repo_root) / "runs"
     d.mkdir(parents=True, exist_ok=True)
@@ -377,6 +420,7 @@ def _runs_dir(repo_root: Path) -> Path:
 
 
 def persist_run_record(result: RunResult, repo_root: Path) -> Path:
+    _validate_run_id(result.run_id)
     path = _runs_dir(repo_root) / f"{result.run_id}.json"
     path.write_text(result.model_dump_json(indent=2))
     return path
@@ -414,7 +458,13 @@ def _append_prompt_log(
 
 
 def load_run_record(run_id: str, repo_root: Path) -> RunResult:
-    path = _runs_dir(repo_root) / f"{run_id}.json"
+    _validate_run_id(run_id)
+    runs_dir = _runs_dir(repo_root).resolve()
+    path = (runs_dir / f"{run_id}.json").resolve()
+    # Defense-in-depth: even after regex validation, refuse if the resolved path
+    # escapes the runs directory.
+    if not str(path).startswith(str(runs_dir) + "/"):
+        raise ValueError(f"run_id {run_id!r} resolves outside runs dir")
     if not path.exists():
         raise FileNotFoundError(f"No run record for {run_id!r} at {path}")
     return RunResult.model_validate_json(path.read_text())
@@ -497,65 +547,45 @@ async def run(
         with wt.worktree_pair(
             repo_root, run_id, config.base_ref, keep_on_failure=config.keep_worktrees
         ) as pair:
+            # Capture base_sha so apply_run_result compares against the actual SHA
+            # this run was based on (re-resolving base_ref="HEAD" at apply time
+            # would be tautological).
+            result.base_sha = pair.base_sha
             project_context = load_project_context(repo_root, config)
 
-            for round_num in range(1, config.max_revisions + 2):
-                # ─── WRITER ───
-                if round_num == 1:
-                    writer_prompt = _build_writer_initial_prompt(config.prompt, project_context)
-                    writer_call_kwargs: dict[str, Any] = {
-                        "permission_mode": ClaudePermissionMode.BYPASS,
-                    }
-                else:
-                    prev = rounds[-1]
-                    writer_prompt = _build_writer_revision_prompt(
-                        config.prompt,
-                        prev.writer_report,
-                        prev.reviewer_critique,
-                        wt.extract_diff(pair),
-                        project_context,
-                    )
-                    writer_call_kwargs = {"permission_mode": ClaudePermissionMode.BYPASS}
+            # ─── INITIAL WRITER (runs once before the loop) ───
+            writer_prompt = _build_writer_initial_prompt(config.prompt, project_context)
+            emit(EventType.WRITER_STARTED, f"Round 1: writer ({config.writer.cli.value}) initial draft")
+            writer_result = await _invoke_logged(
+                writer_inv,
+                cli=config.writer.cli,
+                prompt=writer_prompt,
+                cfg=config.writer,
+                cwd=pair.writer_path,
+                output_schema=writer_report_schema,
+                extra={"permission_mode": ClaudePermissionMode.BYPASS},
+                timeout_s=config.timeout_per_agent_s,
+                repo_root=repo_root,
+                run_id=run_id,
+                phase="writer_initial",
+                round_num=1,
+                role="writer",
+            )
+            total_cost += float(writer_result.cost_usd or 0.0)
+            emit(
+                EventType.WRITER_DONE,
+                f"Round 1: writer done (${writer_result.cost_usd:.4f}, "
+                f"{writer_result.duration_s:.1f}s)",
+                {"cost_usd": writer_result.cost_usd, "duration_s": writer_result.duration_s},
+            )
+            if writer_result.is_error:
+                raise RuntimeError(f"Writer failed: {writer_result.error}")
 
-                phase_label = "writer_initial" if round_num == 1 else "writer_continuation"
-                emit(EventType.WRITER_STARTED, f"Round {round_num}: writer ({config.writer.cli.value})")
-                writer_result = await _invoke_logged(
-                    writer_inv,
-                    cli=config.writer.cli,
-                    prompt=writer_prompt,
-                    cfg=config.writer,
-                    cwd=pair.writer_path,
-                    output_schema=(
-                        writer_report_schema if round_num == 1 else response_schema
-                    ),
-                    extra=writer_call_kwargs,
-                    timeout_s=config.timeout_per_agent_s,
-                    repo_root=repo_root,
-                    run_id=run_id,
-                    phase=phase_label,
-                    round_num=round_num,
-                    role="writer",
-                )
-                total_cost += float(writer_result.cost_usd or 0.0)
-                emit(
-                    EventType.WRITER_DONE,
-                    f"Round {round_num}: writer done (${writer_result.cost_usd:.4f}, "
-                    f"{writer_result.duration_s:.1f}s)",
-                    {"cost_usd": writer_result.cost_usd, "duration_s": writer_result.duration_s},
-                )
-                if writer_result.is_error:
-                    raise RuntimeError(f"Writer failed: {writer_result.error}")
+            writer_report = _coerce_structured(writer_result.structured, WriterReport)
 
-                if round_num == 1:
-                    writer_report = _coerce_structured(writer_result.structured, WriterReport)
-                    writer_responses_bundle: WriterResponseBundle | None = None
-                else:
-                    writer_responses_bundle = _coerce_structured(
-                        writer_result.structured, WriterResponseBundle
-                    )
-                    writer_report = rounds[-1].writer_report  # carry forward
-
-                # Source of truth for the diff is the worktree, not the LLM's report.
+            # ─── LOOP: critique → respond → (maybe rebut) → loop or terminate ───
+            round_num = 1
+            while True:
                 authoritative_diff = wt.extract_diff(pair)
                 if len(authoritative_diff.splitlines()) > config.max_diff_lines:
                     raise RuntimeError(
@@ -563,11 +593,14 @@ async def run(
                         f"({len(authoritative_diff.splitlines())} lines); narrow the prompt."
                     )
 
-                # ─── REVIEWER ───
+                # ─── REVIEWER critique ───
                 reviewer_prompt = _build_reviewer_critique_prompt(
                     config.prompt, writer_report, authoritative_diff, project_context
                 )
-                emit(EventType.REVIEWER_STARTED, f"Round {round_num}: reviewer ({config.reviewer.cli.value})")
+                emit(
+                    EventType.REVIEWER_STARTED,
+                    f"Round {round_num}: reviewer ({config.reviewer.cli.value})",
+                )
                 reviewer_result = await _invoke_logged(
                     reviewer_inv,
                     cli=config.reviewer.cli,
@@ -586,7 +619,6 @@ async def run(
                 total_cost += float(reviewer_result.cost_usd or 0.0)
                 if reviewer_result.is_error:
                     raise RuntimeError(f"Reviewer failed: {reviewer_result.error}")
-
                 critique = _coerce_structured(reviewer_result.structured, ReviewerCritique)
                 _validate_critique_unique_ids(critique)
                 emit(
@@ -595,15 +627,16 @@ async def run(
                     f"({len(critique.items)} items, ${reviewer_result.cost_usd:.4f})",
                     {"verdict": critique.verdict.value, "items": len(critique.items)},
                 )
+
                 round_obj = RevisionRound(
                     round_number=round_num,
                     writer_report=writer_report,
                     reviewer_critique=critique,
-                    writer_responses=writer_responses_bundle,
+                    writer_responses=None,
                     reviewer_rebuttal=None,
                 )
 
-                # ─── Terminal verdicts ───
+                # ─── Terminal verdicts on the critique ───
                 if critique.verdict == ReviewerVerdict.APPROVE:
                     rounds.append(round_obj)
                     break
@@ -612,32 +645,25 @@ async def run(
                     rounds.append(round_obj)
                     result.status = RunStatus.FAILED
                     result.error = f"Reviewer rejected outright: {critique.summary}"
-                    rounds_done = True  # noqa: F841
                     break
 
-                # ─── REVISE path ───
+                # REVISE: out of revisions → ship; items get classified as unresolved.
                 if round_num > config.max_revisions:
-                    # Out of revisions; ship with current critique unresolved.
                     rounds.append(round_obj)
                     break
 
-                # Need a writer revision next round. But we also need the writer's response NOW
-                # (this iteration), then check for rebuttal — the loop body covers both in one round.
-                writer_revision_prompt = _build_writer_revision_prompt(
-                    config.prompt,
-                    writer_report,
-                    critique,
-                    authoritative_diff,
-                    project_context,
+                # ─── WRITER per-item response (the one writer call per revision round) ───
+                writer_response_prompt = _build_writer_revision_prompt(
+                    config.prompt, writer_report, critique, authoritative_diff, project_context,
                 )
                 emit(
                     EventType.REVISION_STARTED,
                     f"Round {round_num}: writer responding to {len(critique.items)} item(s)",
                 )
-                writer_revision_result = await _invoke_logged(
+                writer_response_result = await _invoke_logged(
                     writer_inv,
                     cli=config.writer.cli,
-                    prompt=writer_revision_prompt,
+                    prompt=writer_response_prompt,
                     cfg=config.writer,
                     cwd=pair.writer_path,
                     output_schema=response_schema,
@@ -649,11 +675,11 @@ async def run(
                     round_num=round_num,
                     role="writer",
                 )
-                total_cost += float(writer_revision_result.cost_usd or 0.0)
-                if writer_revision_result.is_error:
-                    raise RuntimeError(f"Writer revision failed: {writer_revision_result.error}")
+                total_cost += float(writer_response_result.cost_usd or 0.0)
+                if writer_response_result.is_error:
+                    raise RuntimeError(f"Writer revision failed: {writer_response_result.error}")
                 response_bundle = _coerce_structured(
-                    writer_revision_result.structured, WriterResponseBundle
+                    writer_response_result.structured, WriterResponseBundle
                 )
                 _validate_response_covers_critique(response_bundle, critique)
                 round_obj.writer_responses = response_bundle
@@ -662,10 +688,11 @@ async def run(
                 emit(
                     EventType.REVISION_DONE,
                     f"Round {round_num}: writer accepted {n_accept}, defended {n_reject} "
-                    f"(${writer_revision_result.cost_usd:.4f})",
+                    f"(${writer_response_result.cost_usd:.4f})",
                     {"accepted": n_accept, "rejected": n_reject},
                 )
 
+                # Re-check size after writer's edits.
                 revised_diff = wt.extract_diff(pair)
                 if len(revised_diff.splitlines()) > config.max_diff_lines:
                     raise RuntimeError(
@@ -683,12 +710,8 @@ async def run(
                         f"Round {round_num}: reviewer rebutting {len(rejected_responses)} defended item(s)",
                     )
                     rebuttal_prompt = _build_reviewer_rebuttal_prompt(
-                        config.prompt,
-                        writer_report,
-                        critique,
-                        response_bundle,
-                        revised_diff,
-                        project_context,
+                        config.prompt, writer_report, critique, response_bundle,
+                        revised_diff, project_context,
                     )
                     rebuttal_result = await _invoke_logged(
                         reviewer_inv,
@@ -712,8 +735,7 @@ async def run(
                     _validate_rebuttal_covers_rejections(rebuttal, response_bundle)
                     round_obj.reviewer_rebuttal = rebuttal
                     n_still = sum(
-                        1
-                        for r in rebuttal.item_rebuttals
+                        1 for r in rebuttal.item_rebuttals
                         if r.verdict == ItemRebuttalVerdict.STILL_DISPUTED
                     )
                     emit(
@@ -722,20 +744,17 @@ async def run(
                         f"({n_still} still disputed, ${rebuttal_result.cost_usd:.4f})",
                     )
                     rounds.append(round_obj)
-
-                    # If reviewer approves (no still_disputed at item level), we're done.
-                    still_disputed = any(
-                        r.verdict == ItemRebuttalVerdict.STILL_DISPUTED
-                        for r in rebuttal.item_rebuttals
-                    )
-                    if not still_disputed:
-                        break
-                    # Otherwise: stop here. Disputes go to user, no more iteration.
+                    # After a rebuttal we always terminate this run — any still_disputed
+                    # items escalate to the user (no further iteration would change them
+                    # without new information).
                     break
-                else:
-                    # Writer accepted everything; loop back for another reviewer pass on the revision.
-                    rounds.append(round_obj)
-                    continue
+
+                # All accepts: append round, loop back for another reviewer pass on the
+                # revised diff. No additional writer call — the writer's accepts already
+                # changed the worktree, and the loop's next iteration extracts the new
+                # diff and re-critiques.
+                rounds.append(round_obj)
+                round_num += 1
 
             # ─── Final assembly ───
             result.diff = wt.extract_diff(pair)
@@ -753,15 +772,16 @@ async def run(
             result.duration_s = (result.finished_at - result.started_at).total_seconds()
 
         if result.status != RunStatus.FAILED:
-            disputed, dissents, resolved = _classify_round_items(rounds)
+            disputed, dissents, resolved, unresolved = _classify_round_items(rounds)
             result.disputed_items = disputed
             result.acknowledged_dissents = dissents
             result.resolved_items = resolved
-            if disputed:
+            result.unresolved_items = unresolved
+            if disputed or unresolved:
                 result.status = RunStatus.AWAITING_ARBITRATION
             else:
                 result.status = RunStatus.AWAITING_APPROVAL
-            result.summary = _build_summary(rounds, disputed, dissents)
+            result.summary = _build_summary(rounds, disputed, dissents, unresolved)
 
         result.audit_log_path = str(persist_run_record(result, repo_root))
 
@@ -915,14 +935,22 @@ async def run_streaming(config: RunConfig, repo_root: Path) -> AsyncIterator[Str
 
 
 def apply_run_result(result: RunResult, repo_root: Path) -> RunResult:
-    if result.status not in (RunStatus.AWAITING_APPROVAL,):
+    if result.status != RunStatus.AWAITING_APPROVAL:
         raise RuntimeError(
             f"Cannot apply run {result.run_id}: status={result.status.value} "
-            "(must be AWAITING_APPROVAL — resolve any disputes via `dialectic arbitrate` first)."
+            "(must be AWAITING_APPROVAL — resolve any disputes/unresolved items via "
+            "`dialectic arbitrate` first)."
         )
 
+    # Use the SHA captured at run-start, not a fresh resolution of base_ref.
+    # If we re-resolved "HEAD" here it'd be tautologically equal to current_head
+    # even after the user has switched branches or committed something else.
+    base_sha = result.base_sha
+    if not base_sha:
+        # Backwards-compat with run records persisted before base_sha was tracked.
+        base_sha = wt.resolve_base_sha(repo_root, result.config.base_ref)
+
     current_head = wt.current_head_sha(repo_root)
-    base_sha = wt.resolve_base_sha(repo_root, result.config.base_ref)
     if current_head != base_sha:
         raise RuntimeError(
             f"HEAD moved since run started (base was {base_sha[:8]}, now {current_head[:8]}). "
@@ -930,10 +958,8 @@ def apply_run_result(result: RunResult, repo_root: Path) -> RunResult:
         )
 
     if result.config.apply_mode == ApplyMode.DRY_RUN:
-        # No-op; just mark as success.
-        result.status = (
-            RunStatus.APPLIED_WITH_DISSENT if result.acknowledged_dissents else RunStatus.SUCCESS
-        )
+        # No-op; keep status as AWAITING_APPROVAL so the user can still
+        # `dialectic approve` with a real apply_mode later if they want.
         persist_run_record(result, repo_root)
         return result
 
@@ -968,20 +994,29 @@ async def resume_with_arbitration(
             f"Run {run_id} is not awaiting arbitration (status={result.status.value})."
         )
 
-    disputed_ids = {d.item.id for d in result.disputed_items}
-    decision_ids = {d.item_id for d in decisions}
+    # Combine disputed_items (writer rejected + reviewer disputed) and unresolved_items
+    # (max_revisions exhausted before writer could respond) — both need user arbitration.
+    needs_decision_ids = (
+        {d.item.id for d in result.disputed_items}
+        | {item.id for item in result.unresolved_items}
+    )
 
-    missing = disputed_ids - decision_ids
-    extra_ids = decision_ids - disputed_ids
+    decision_ids_list = [d.item_id for d in decisions]
+    decision_ids = set(decision_ids_list)
+    if len(decision_ids_list) != len(decision_ids):
+        dupes = [i for i, c in Counter(decision_ids_list).items() if c > 1]
+        raise RuntimeError(f"Duplicate arbitration decisions for item id(s): {sorted(dupes)}")
+
+    missing = needs_decision_ids - decision_ids
+    extra_ids = decision_ids - needs_decision_ids
     if missing:
         raise RuntimeError(f"Missing arbitration decisions for item id(s): {sorted(missing)}")
     if extra_ids:
         raise RuntimeError(f"Got decisions for non-disputed item id(s): {sorted(extra_ids)}")
 
-    # For v1, ACCEPT_WRITER and SKIP both keep the writer's diff as-is. ACCEPT_REVIEWER
-    # would require applying suggested_fix as a patch on top, which needs a fix-format
-    # convention we haven't pinned down yet — defer to v1.1 with explicit "reviewer
-    # rewrite" pass. For now, ACCEPT_REVIEWER raises.
+    # ACCEPT_REVIEWER requires applying suggested_fix as a patch on top of the writer's
+    # diff, which needs a fix-format convention we haven't pinned down (suggested_fix is
+    # free-text). Defer until v1.1.
     for d in decisions:
         if d.choice == ArbitrationChoice.ACCEPT_REVIEWER:
             raise NotImplementedError(
@@ -990,14 +1025,20 @@ async def resume_with_arbitration(
             )
 
     result.arbitration = decisions
-    # Move disputed items to dissents (they ship with arbitration noted).
+    decision_by_id = {d.item_id: d for d in decisions}
+
+    # Move disputed items to dissents (they ship with the writer's diff + arbitration log).
     for d in result.disputed_items:
-        decision = next(dec for dec in decisions if dec.item_id == d.item.id)
-        if decision.choice in (ArbitrationChoice.ACCEPT_WRITER, ArbitrationChoice.SKIP):
+        if decision_by_id[d.item.id].choice in (ArbitrationChoice.ACCEPT_WRITER, ArbitrationChoice.SKIP):
             result.acknowledged_dissents.append(
                 AcknowledgedDissent(item=d.item, writer_response=d.writer_response)
             )
     result.disputed_items = []
+
+    # Unresolved items have no writer_response; if the user accepts/skips, they're noted
+    # in arbitration. We don't promote them to dissents (no rationale to record).
+    result.unresolved_items = []
+
     result.status = RunStatus.AWAITING_APPROVAL
     persist_run_record(result, repo_root)
     return result

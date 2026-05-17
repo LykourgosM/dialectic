@@ -394,7 +394,16 @@ class RunResult(_Strict):
     status: RunStatus
     config: RunConfig
 
-    diff: str = Field(default="", description="Final consensus unified diff against base_ref.")
+    base_sha: str = Field(
+        default="",
+        description=(
+            "Immutable SHA the run was based on (resolved from config.base_ref at run start). "
+            "apply_run_result compares this against current HEAD to detect drift — re-resolving "
+            "base_ref at apply time would be tautological when base_ref='HEAD'."
+        ),
+    )
+
+    diff: str = Field(default="", description="Final consensus unified diff against base_sha.")
     files_changed: list[str] = Field(default_factory=list)
 
     rounds: list[RevisionRound] = Field(
@@ -403,10 +412,17 @@ class RunResult(_Strict):
     )
     resolved_items: list[CritiqueItem] = Field(default_factory=list)
     disputed_items: list[DisputedItem] = Field(default_factory=list)
+    unresolved_items: list[CritiqueItem] = Field(
+        default_factory=list,
+        description=(
+            "Critique items raised in the final round but never reached the writer-response phase "
+            "(e.g. max_revisions exhausted). User must arbitrate via the same flow as disputed_items."
+        ),
+    )
     acknowledged_dissents: list[AcknowledgedDissent] = Field(default_factory=list)
     arbitration: list[ArbitrationDecision] = Field(
         default_factory=list,
-        description="User's resolutions for disputed items (empty until arbitration completes).",
+        description="User's resolutions for disputed/unresolved items (empty until arbitration completes).",
     )
 
     summary: str = Field(default="", description="Human-readable wrap-up shown at approval time.")
