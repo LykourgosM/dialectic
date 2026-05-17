@@ -166,8 +166,15 @@ def _build_reviewer_critique_prompt(
         "```",
         "",
         "INSTRUCTIONS:",
-        "1. You have read-only access to the codebase via your cwd (a clean copy at the base ref).",
-        "2. Review the diff against the original task and project conventions.",
+        "1. Your cwd is a clean copy of the codebase at the base ref. You have a "
+        "writable sandbox there — feel free to apply the diff (via `git apply` from "
+        "stdin), run tests, lint, type-check, or otherwise execute verification "
+        "commands. Your worktree is throwaway; any changes you make here are "
+        "discarded at the end of the run.",
+        "2. Review the diff against the original task and project conventions. "
+        "Whenever feasible, EXECUTE something — tests, a lint, a quick script — "
+        "rather than relying on inspection alone. State in your summary what you "
+        "actually executed.",
         "3. Output a single ReviewerCritique JSON object.",
         "4. Use unique integer ids for each CritiqueItem. The writer references items by id.",
         "5. Set verdict=approve if the diff is ready as-is.",
@@ -608,7 +615,7 @@ async def run(
                     cfg=config.reviewer,
                     cwd=pair.reviewer_path,
                     output_schema=critique_schema,
-                    extra={"sandbox": SandboxMode.READ_ONLY},
+                    extra={"sandbox": SandboxMode.WORKSPACE_WRITE},
                     timeout_s=config.timeout_per_agent_s,
                     repo_root=repo_root,
                     run_id=run_id,
@@ -720,7 +727,7 @@ async def run(
                         cfg=config.reviewer,
                         cwd=pair.reviewer_path,
                         output_schema=rebuttal_schema,
-                        extra={"sandbox": SandboxMode.READ_ONLY},
+                        extra={"sandbox": SandboxMode.WORKSPACE_WRITE},
                         timeout_s=config.timeout_per_agent_s,
                         repo_root=repo_root,
                         run_id=run_id,
