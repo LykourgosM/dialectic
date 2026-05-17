@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.venv/
+.eggs/
+
+# Tools
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Dialectic runtime artifacts (project memory stays committed; transient state does not)
+.dialectic/wt/
+.dialectic/runs/
+
+# Local config
+*.local.toml
