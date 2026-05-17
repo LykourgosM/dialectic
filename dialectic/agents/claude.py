@@ -7,11 +7,9 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import AsyncIterator
+from pydantic import BaseModel, Field
 
-from pydantic import BaseModel
-
-from ..protocol import AgentConfig, ClaudePermissionMode, StreamEvent
+from ..protocol import AgentConfig, ClaudePermissionMode
 
 
 class ClaudeInvocation(BaseModel):
@@ -20,7 +18,7 @@ class ClaudeInvocation(BaseModel):
     cwd: Path
     output_schema: dict | None = None
     system_prompt: str | None = None
-    additional_dirs: list[Path] = []
+    additional_dirs: list[Path] = Field(default_factory=list)
     max_budget_usd: float | None = None
     permission_mode: ClaudePermissionMode = ClaudePermissionMode.BYPASS
 
@@ -125,12 +123,11 @@ async def invoke(invocation: ClaudeInvocation, timeout_s: int = 1500) -> ClaudeR
             error=stderr.strip() or f"exit code {proc.returncode}",
         )
 
-    # Tolerate any pre-JSON noise (update banners, ANSI codes) by finding the first '{'.
+    # Tolerate any pre-JSON noise (update banners, ANSI codes) by skipping to the first '{'
+    # if anything non-whitespace precedes it.
     parse_target = stdout
     first_brace = stdout.find("{")
-    if first_brace > 0 and not stdout[:first_brace].strip():
-        parse_target = stdout
-    elif first_brace > 0:
+    if first_brace > 0 and stdout[:first_brace].strip():
         parse_target = stdout[first_brace:]
 
     try:
@@ -166,7 +163,3 @@ async def invoke(invocation: ClaudeInvocation, timeout_s: int = 1500) -> ClaudeR
     )
 
 
-async def invoke_streaming(invocation: ClaudeInvocation) -> AsyncIterator[StreamEvent]:
-    """Stream-json variant. Not implemented in v1 — use invoke() for now."""
-    raise NotImplementedError("Streaming variant deferred to v1.1.")
-    yield  # type: ignore[unreachable]

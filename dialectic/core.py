@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import tempfile
 import uuid
@@ -11,8 +12,6 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable
-
-logger = logging.getLogger("dialectic")
 
 from . import worktree as wt
 from .agents.claude import ClaudeInvocation, ClaudeResult
@@ -47,9 +46,28 @@ from .protocol import (
     WriterResponseBundle,
 )
 
-# Invokers can be swapped for testing.
-WriterInvoke = Callable[[str, AgentConfig, Path, dict, ClaudePermissionMode | None, int], Awaitable[Any]]
-ReviewerInvoke = Callable[[str, AgentConfig, Path, dict, SandboxMode | None, int], Awaitable[Any]]
+logger = logging.getLogger("dialectic")
+
+# Invokers can be swapped for testing. Writer takes a permission_mode; reviewer takes a sandbox.
+WriterInvoke = Callable[
+    [str, AgentConfig, Path, dict[str, Any], ClaudePermissionMode | None, int],
+    Awaitable[Any],
+]
+ReviewerInvoke = Callable[
+    [str, AgentConfig, Path, dict[str, Any], SandboxMode | None, int],
+    Awaitable[Any],
+]
+
+
+__all__ = [
+    "run",
+    "apply_run_result",
+    "reject_run_result",
+    "resume_with_arbitration",
+    "load_run_record",
+    "persist_run_record",
+    "load_project_context",
+]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -86,7 +104,9 @@ async def _default_codex_invoker(
     timeout_s: int,
 ) -> CodexResult:
     strict = _make_strict_schema(output_schema)
-    schema_path = Path(tempfile.mkstemp(suffix=".json", prefix="dialectic-schema-")[1])
+    fd, path_str = tempfile.mkstemp(suffix=".json", prefix="dialectic-schema-")
+    os.close(fd)  # mkstemp leaves the fd open; close it to avoid leaking one per call.
+    schema_path = Path(path_str)
     schema_path.write_text(json.dumps(strict))
     try:
         return await _codex_invoke(
@@ -276,20 +296,25 @@ def _gen_run_id() -> str:
 
 def _coerce_structured(raw: Any, model_cls: type) -> Any:
     """Try several shapes that the CLIs might return; raise ValueError if none parse."""
+    from pydantic import ValidationError
+
     if isinstance(raw, model_cls):
         return raw
     if isinstance(raw, dict):
         return model_cls.model_validate(raw)
     if isinstance(raw, str):
+        first_exc: Exception | None = None
         try:
             return model_cls.model_validate_json(raw)
-        except Exception:
-            try:
-                return model_cls.model_validate(json.loads(raw))
-            except Exception as exc:
-                raise ValueError(
-                    f"Could not coerce string to {model_cls.__name__}: {exc}; raw={raw[:300]!r}"
-                ) from exc
+        except (ValidationError, ValueError) as exc:
+            first_exc = exc
+        try:
+            return model_cls.model_validate(json.loads(raw))
+        except (ValidationError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"Could not coerce string to {model_cls.__name__}: {exc} "
+                f"(first parse error: {first_exc}); raw={raw[:300]!r}"
+            ) from exc
     raise ValueError(f"Could not coerce {type(raw).__name__} to {model_cls.__name__}")
 
 
@@ -915,25 +940,29 @@ def _validate_rebuttal_covers_rejections(
 
 
 def _files_in_diff(diff: str) -> list[str]:
+    """Return the deduped list of files touched by a unified diff (modifications + deletions)."""
     files: list[str] = []
+    seen: set[str] = set()
     for line in diff.splitlines():
+        path: str | None = None
         if line.startswith("+++ b/"):
-            files.append(line[len("+++ b/") :])
-        elif line.startswith("--- a/") and line[len("--- a/") :] not in files:
-            # Track deletions too
-            pass
+            candidate = line[len("+++ b/") :].strip()
+            if candidate != "/dev/null":
+                path = candidate
+        elif line.startswith("--- a/"):
+            # Captures deletions where the +++ side is /dev/null.
+            candidate = line[len("--- a/") :].strip()
+            if candidate != "/dev/null":
+                path = candidate
+        if path and path not in seen:
+            seen.add(path)
+            files.append(path)
     return files
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Streaming variant
 # ──────────────────────────────────────────────────────────────────────────────
-
-
-async def run_streaming(config: RunConfig, repo_root: Path) -> AsyncIterator[StreamEvent]:
-    """Streaming wrapper — emits coarse-grained events. Real-time CLI streaming is v1.1."""
-    raise NotImplementedError("Streaming variant deferred to v1.1. Use run() for now.")
-    yield  # type: ignore[unreachable]
 
 
 # ──────────────────────────────────────────────────────────────────────────────

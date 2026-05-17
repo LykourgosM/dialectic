@@ -21,16 +21,14 @@ from dialectic.protocol import (
 
 
 @pytest.fixture
-def repo_root_server(tmp_git_repo: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Point the server at a temp repo and clear any auth token."""
-    monkeypatch.setattr(server, "REPO_ROOT", tmp_git_repo)
-    monkeypatch.setattr(server, "AUTH_TOKEN", None)
-    return tmp_git_repo
+def app(tmp_git_repo: Path):
+    """A FastAPI app scoped to tmp_git_repo with no auth — fresh per test."""
+    return server.create_app(tmp_git_repo, auth_token=None)
 
 
 @pytest.fixture
-def client(repo_root_server: Path) -> TestClient:
-    return TestClient(server.app)
+def client(app) -> TestClient:
+    return TestClient(app)
 
 
 def _persist_result(repo_root: Path, run_id: str = "20260517-120000-abcdef") -> RunResult:
@@ -62,11 +60,10 @@ def test_get_run_returns_400_on_invalid_run_id(client: TestClient) -> None:
     """Path-traversal regression: a bogus run_id is rejected with 400, not silently 404."""
     response = client.get("/run/..%2F..%2Fetc%2Fpasswd")
     assert response.status_code in (400, 404)
-    # 404 if FastAPI rejects URL decoding; either way the file is not read.
 
 
-def test_get_run_returns_persisted_record(client: TestClient, repo_root_server: Path) -> None:
-    persisted = _persist_result(repo_root_server)
+def test_get_run_returns_persisted_record(client: TestClient, tmp_git_repo: Path) -> None:
+    persisted = _persist_result(tmp_git_repo)
     response = client.get(f"/run/{persisted.run_id}")
     assert response.status_code == 200
     body = response.json()
@@ -79,8 +76,8 @@ def test_post_approve_404_when_missing(client: TestClient) -> None:
     assert response.status_code == 404
 
 
-def test_post_reject_marks_status(client: TestClient, repo_root_server: Path) -> None:
-    persisted = _persist_result(repo_root_server)
+def test_post_reject_marks_status(client: TestClient, tmp_git_repo: Path) -> None:
+    persisted = _persist_result(tmp_git_repo)
     response = client.post(f"/run/{persisted.run_id}/reject")
     assert response.status_code == 200
     assert response.json()["status"] == "rejected_by_user"
@@ -88,28 +85,21 @@ def test_post_reject_marks_status(client: TestClient, repo_root_server: Path) ->
 
 def test_post_arbitrate_validates_run_id_format(client: TestClient) -> None:
     response = client.post("/run/not_a_valid_id/arbitrate", json=[])
-    # 400 (bad run_id format) or 404 (not found) — either is fine; the key is
-    # NO file read with a malformed id.
     assert response.status_code in (400, 404)
 
 
-def test_auth_required_when_token_set(
-    repo_root_server: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(server, "AUTH_TOKEN", "secret-token")
-    client = TestClient(server.app)
+def test_auth_required_when_token_set(tmp_git_repo: Path) -> None:
+    app = server.create_app(tmp_git_repo, auth_token="secret-token")
+    client = TestClient(app)
 
-    # No auth header → 401
     response = client.get("/run/20260517-120000-abcdef")
     assert response.status_code == 401
 
-    # Wrong token → 401
     response = client.get(
         "/run/20260517-120000-abcdef", headers={"Authorization": "Bearer wrong"}
     )
     assert response.status_code == 401
 
-    # Correct token → 404 (file doesn't exist, but auth passed)
     response = client.get(
         "/run/20260517-120000-abcdef", headers={"Authorization": "Bearer secret-token"}
     )
@@ -125,6 +115,5 @@ def test_serve_refuses_non_loopback_without_token(monkeypatch: pytest.MonkeyPatc
 def test_serve_loopback_ok_without_token(monkeypatch: pytest.MonkeyPatch) -> None:
     """127.0.0.1 binds without a token (loopback is implicitly trusted)."""
     import uvicorn
-    monkeypatch.setattr(uvicorn, "run", lambda *a, **kw: None)  # don't actually serve
-    # Should not raise.
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **kw: None)
     server.run(host="127.0.0.1", port=8765)

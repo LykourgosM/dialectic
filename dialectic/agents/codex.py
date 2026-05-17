@@ -10,11 +10,11 @@ import re
 import time
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from ..protocol import AgentConfig, SandboxMode, StreamEvent
+from ..protocol import AgentConfig, SandboxMode
 
 logger = logging.getLogger("dialectic.agents.codex")
 
@@ -24,7 +24,7 @@ class CodexInvocation(BaseModel):
     prompt: str
     cwd: Path
     output_schema_path: Path | None = None
-    additional_dirs: list[Path] = []
+    additional_dirs: list[Path] = Field(default_factory=list)
     sandbox: SandboxMode = SandboxMode.WORKSPACE_WRITE
 
 
@@ -240,12 +240,6 @@ def _compute_codex_cost(
         + cached_input_tokens * pricing["cached_input"]
         + output_tokens * pricing["output"]
     )
-
-
-async def invoke_streaming(invocation: CodexInvocation) -> AsyncIterator[StreamEvent]:
-    """Stream-json variant. Not implemented in v1 — use invoke() for now."""
-    raise NotImplementedError("Streaming variant deferred to v1.1.")
-    yield  # type: ignore[unreachable]
 
 
 def _make_strict_schema(schema: dict[str, Any]) -> dict[str, Any]:

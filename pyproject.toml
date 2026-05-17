@@ -6,6 +6,23 @@ requires-python = ">=3.11"
 authors = [{ name = "Luke Marinos" }]
 license = { text = "MIT" }
 readme = "README.md"
+keywords = [
+    "llm", "code-generation", "code-review", "multi-agent", "claude", "codex",
+    "agent-orchestration", "ai", "cli", "developer-tools",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Code Generators",
+    "Topic :: Software Development :: Quality Assurance",
+    "Typing :: Typed",
+]
 dependencies = [
     "pydantic>=2.5",
     "click>=8.1",
@@ -19,9 +36,17 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
-    "ruff>=0.4",
+    "pytest-cov>=5.0",
+    "ruff>=0.6.9",
     "mypy>=1.9",
+    "pre-commit>=3.7",
 ]
+
+[project.urls]
+Homepage = "https://github.com/LykourgosM/dialectic"
+Repository = "https://github.com/LykourgosM/dialectic"
+Issues = "https://github.com/LykourgosM/dialectic/issues"
+Changelog = "https://github.com/LykourgosM/dialectic/blob/main/CHANGELOG.md"
 
 [project.scripts]
 dialectic = "dialectic.cli:main"
@@ -33,9 +58,117 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["dialectic"]
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ruff (lint + format)
+# ──────────────────────────────────────────────────────────────────────────────
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+extend-exclude = [".dialectic", ".venv"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "B", "UP", "SIM"]
+select = [
+    "E", "F", "W",   # pycodestyle + pyflakes
+    "I",             # isort
+    "B",             # flake8-bugbear
+    "UP",            # pyupgrade
+    "SIM",           # flake8-simplify
+    "PT",            # pytest-style
+    "RUF",           # ruff-specific
+    "PIE",           # misc anti-patterns
+]
+ignore = [
+    "E501",     # line too long (formatter handles)
+    "B008",     # function-call-in-default — fine for Field(default_factory=...)
+    "SIM117",   # combine nested with — sometimes nested is clearer
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["PT011"]  # broad pytest.raises is fine in tests
+"dialectic/protocol.py" = []
+"examples/**" = ["E402"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["dialectic"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# mypy
+# ──────────────────────────────────────────────────────────────────────────────
+
+[tool.mypy]
+python_version = "3.11"
+files = ["dialectic"]
+plugins = ["pydantic.mypy"]
+
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_unreachable = true
+no_implicit_optional = true
+strict_equality = true
+extra_checks = true
+
+[[tool.mypy.overrides]]
+module = ["uvicorn.*", "click.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# pytest
+# ──────────────────────────────────────────────────────────────────────────────
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts = "-ra -q --strict-markers --strict-config"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+filterwarnings = [
+    "error",
+    "ignore::DeprecationWarning:pydantic.*",
+]
+markers = [
+    "slow: tests that take more than a few seconds",
+    "e2e: end-to-end tests that shell out to real claude/codex CLIs (gated by DIALECTIC_E2E=1)",
+]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# coverage
+# ──────────────────────────────────────────────────────────────────────────────
+
+[tool.coverage.run]
+source = ["dialectic"]
+branch = true
+omit = [
+    "*/__init__.py",
+]
+
+[tool.coverage.report]
+precision = 1
+show_missing = true
+skip_covered = false
+fail_under = 70
+exclude_also = [
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+    "\\.\\.\\.",
+]

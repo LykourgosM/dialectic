@@ -1,0 +1,15 @@
+* text=auto eol=lf
+*.py text diff=python
+*.md text
+*.yml text
+*.yaml text
+*.toml text
+*.json text
+
+# binary
+*.png binary
+*.jpg binary
+
+# linguist hints
+tests/** linguist-detectable=true
+.dialectic/** linguist-generated=true

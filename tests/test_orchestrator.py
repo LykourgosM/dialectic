@@ -398,32 +398,6 @@ async def test_prompt_threading_writer_rationale_reaches_rebuttal(tmp_git_repo: 
             )
         )
 
-    reviewer_calls = 0
-
-    async def fake_reviewer(prompt, cfg, cwd, schema, sandbox, timeout):
-        nonlocal reviewer_calls
-        captured.append("REVIEWER_CALL")
-        if reviewer_calls == 0:
-            reviewer_calls += 1
-            return codex_ok(
-                critique_dict(
-                    "revise",
-                    [critique_item_dict(1, "Magic number 42 needs a name", severity="medium")],
-                )
-            )
-        reviewer_calls += 1
-        # Stash the rebuttal prompt
-        captured.append("REBUTTAL_PROMPT_BELOW")
-        captured.append(prompt := arguments_will_be_inspected_via_closure_below)  # set below
-
-        return codex_ok(
-            rebuttal_dict(
-                "approve_with_dissent",
-                [{"item_id": 1, "verdict": "accept_writer_rationale"}],
-            )
-        )
-
-    # We need to actually capture the prompt — redo with a proper closure.
     rebuttal_prompt_holder: list[str] = []
     reviewer_calls = 0
 
