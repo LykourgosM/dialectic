@@ -1,26 +1,10 @@
-"""Subprocess wrapper for `claude -p` (Claude Code in non-interactive mode).
-
-This module is the only place that knows the `claude` CLI's specific flag syntax
-(`--effort`, `--output-format json`, `--permission-mode`, etc.). The rest of the
-orchestrator deals in structured protocol types.
-
-Implementation notes for fill-in:
-  * ALWAYS pass `stdin=asyncio.subprocess.DEVNULL` or pipe the prompt — otherwise
-    `claude -p` prints `Warning: no stdin data received in 3s, proceeding without it…`
-    to stdout, which breaks `json.loads()` on the result.
-  * Cost is at `result.total_cost_usd`; text at `result.result`; structured output
-    at `result.structured_output`; session at `result.session_id`; error flag at
-    `result.is_error`; error reasons at top-level `errors[]`.
-  * Exit code 1 overloads "budget exceeded" and "bad input" — distinguish via
-    parsed `is_error` + `errors[]` rather than exit code alone.
-  * `--json-schema` accepts pydantic's `model_json_schema()` output directly (with
-    $defs and anyOf union nulls) — no transformation needed (unlike Codex).
-  * `--no-session-persistence` keeps things ephemeral.
-  * Pass `ANTHROPIC_API_KEY` from env explicitly when using `--bare` mode.
-"""
+"""Subprocess wrapper for `claude -p` (Claude Code in non-interactive mode)."""
 
 from __future__ import annotations
 
+import asyncio
+import json
+import time
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -30,8 +14,6 @@ from ..protocol import AgentConfig, ClaudePermissionMode, StreamEvent
 
 
 class ClaudeInvocation(BaseModel):
-    """One non-interactive invocation of `claude -p`."""
-
     config: AgentConfig
     prompt: str
     cwd: Path
@@ -40,12 +22,9 @@ class ClaudeInvocation(BaseModel):
     additional_dirs: list[Path] = []
     max_budget_usd: float | None = None
     permission_mode: ClaudePermissionMode = ClaudePermissionMode.BYPASS
-    """The reviewer should use PLAN (no edits) or pass an allowlist of read-only tools."""
 
 
 class ClaudeResult(BaseModel):
-    """Parsed result of a `claude -p` invocation."""
-
     raw_text: str
     structured: dict | None = None
     cost_usd: float = 0.0
@@ -55,33 +34,106 @@ class ClaudeResult(BaseModel):
     error: str | None = None
 
 
-async def invoke(invocation: ClaudeInvocation) -> ClaudeResult:
-    """Run `claude -p` once with the given config; return parsed structured output.
+async def invoke(invocation: ClaudeInvocation, timeout_s: int = 1500) -> ClaudeResult:
+    """Run `claude -p` once and return the parsed result.
 
-    Builds:
-        claude -p <prompt>
-          --model <model>
-          --effort <effort>
-          --output-format json
-          --no-session-persistence
-          --permission-mode <permission_mode>
-          --add-dir <cwd>
-          [--add-dir <dir>]*
-          [--json-schema '<schema>']
-          [--system-prompt '<prompt>']
-          [--max-budget-usd <amount>]
-
-    with stdin=DEVNULL.
+    stdin=DEVNULL is critical: without it, `claude -p` waits 3s and prints a warning to
+    stdout, which breaks `json.loads()`.
     """
-    raise NotImplementedError("Fill in subprocess logic.")
+    cmd: list[str] = [
+        "claude",
+        "-p",
+        invocation.prompt,
+        "--model",
+        invocation.config.model,
+        "--effort",
+        invocation.config.effort,
+        "--output-format",
+        "json",
+        "--no-session-persistence",
+        "--permission-mode",
+        invocation.permission_mode.value,
+        "--add-dir",
+        str(invocation.cwd),
+    ]
+
+    for d in invocation.additional_dirs:
+        cmd.extend(["--add-dir", str(d)])
+
+    if invocation.output_schema is not None:
+        cmd.extend(["--json-schema", json.dumps(invocation.output_schema)])
+
+    if invocation.system_prompt:
+        cmd.extend(["--append-system-prompt", invocation.system_prompt])
+
+    if invocation.max_budget_usd is not None:
+        cmd.extend(["--max-budget-usd", str(invocation.max_budget_usd)])
+
+    start = time.monotonic()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(invocation.cwd),
+        )
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return ClaudeResult(
+                raw_text="",
+                duration_s=time.monotonic() - start,
+                is_error=True,
+                error=f"claude -p timed out after {timeout_s}s",
+            )
+    except FileNotFoundError:
+        return ClaudeResult(
+            raw_text="",
+            duration_s=time.monotonic() - start,
+            is_error=True,
+            error="`claude` binary not found on PATH",
+        )
+
+    duration = time.monotonic() - start
+    stdout = stdout_b.decode("utf-8", errors="replace")
+    stderr = stderr_b.decode("utf-8", errors="replace")
+
+    if proc.returncode != 0 and not stdout.strip():
+        return ClaudeResult(
+            raw_text=stdout,
+            duration_s=duration,
+            is_error=True,
+            error=stderr.strip() or f"exit code {proc.returncode}",
+        )
+
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        return ClaudeResult(
+            raw_text=stdout,
+            duration_s=duration,
+            is_error=True,
+            error=f"JSON parse error: {exc}; first 500 chars of stdout: {stdout[:500]!r}",
+        )
+
+    errors_field = data.get("errors") or []
+    error_msg = str(errors_field[0]) if errors_field else None
+
+    return ClaudeResult(
+        raw_text=data.get("result", ""),
+        structured=data.get("structured_output"),
+        cost_usd=float(data.get("total_cost_usd") or 0.0),
+        duration_s=duration,
+        session_id=data.get("session_id"),
+        is_error=bool(data.get("is_error", False)),
+        error=error_msg,
+    )
 
 
 async def invoke_streaming(invocation: ClaudeInvocation) -> AsyncIterator[StreamEvent]:
-    """Run `claude -p` with `--output-format stream-json --include-partial-messages` and yield StreamEvents.
-
-    Observed event types: `system/init`, `system/status`, `stream_event` (partial deltas),
-    `assistant`, `rate_limit_event`, `result/success`. Translate the relevant ones into
-    orchestrator-level StreamEvents (`WRITER_PROGRESS`, `WRITER_DONE`, etc.).
-    """
-    raise NotImplementedError("Fill in streaming subprocess logic.")
+    """Stream-json variant. Not implemented in v1 — use invoke() for now."""
+    raise NotImplementedError("Streaming variant deferred to v1.1.")
     yield  # type: ignore[unreachable]

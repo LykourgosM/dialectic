@@ -1,26 +1,53 @@
-"""`dialectic ...` CLI.
-
-Thin wrapper over core.py. Renders streaming events with rich + handles approval prompts.
-"""
+"""`dialectic ...` CLI."""
 
 from __future__ import annotations
 
+import asyncio
+import json
+import sys
 from pathlib import Path
 
 import click
+from rich.console import Console
+from rich.panel import Panel
+from rich.syntax import Syntax
+
+from . import core
+from .protocol import (
+    AgentCli,
+    AgentConfig,
+    ApplyMode,
+    ArbitrationChoice,
+    ArbitrationDecision,
+    RunConfig,
+    RunResult,
+    RunStatus,
+    SandboxMode,
+)
+
+console = Console()
 
 
 @click.group()
 @click.version_option()
-def main() -> None:
+@click.option("-v", "--verbose", count=True, help="INFO logging (-v) or DEBUG logging (-vv).")
+def main(verbose: int) -> None:
     """dialectic: cross-family writer-reviewer protocol for LLM code generation."""
+    import logging
+
+    level = logging.WARNING
+    if verbose == 1:
+        level = logging.INFO
+    elif verbose >= 2:
+        level = logging.DEBUG
+    logging.basicConfig(level=level, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
 
 @main.command("run")
 @click.option("--prompt", "-p", required=True, help="The coding task for the writer.")
 @click.option("--writer-cli", type=click.Choice(["claude", "codex"]), default="claude")
 @click.option("--writer-model", default="claude-opus-4-7")
-@click.option("--writer-effort", default="max", help="low|medium|high|xhigh|max (Claude); minimal..xhigh (Codex)")
+@click.option("--writer-effort", default="max")
 @click.option("--reviewer-cli", type=click.Choice(["claude", "codex"]), default="codex")
 @click.option("--reviewer-model", default="gpt-5.4")
 @click.option("--reviewer-effort", default="xhigh")
@@ -29,17 +56,20 @@ def main() -> None:
     "--apply-mode",
     type=click.Choice(["uncommitted", "branch", "dry_run"]),
     default="uncommitted",
-    help="How to land the approved diff. 'uncommitted' = on your current branch, like Claude Code edits.",
 )
 @click.option("--dry-run", "dry_run_shortcut", is_flag=True, help="Shortcut for --apply-mode dry_run.")
-@click.option("--branch-name", default=None, help="Branch name when --apply-mode=branch.")
-@click.option("--base-ref", default="HEAD", help="Git ref to branch worktrees from.")
-@click.option("--keep-worktrees", is_flag=True, help="Keep worktrees on failure for debugging.")
-@click.option("--stream/--no-stream", default=True)
-@click.option("--auto-approve", is_flag=True, help="Skip the approval prompt (for scripts).")
+@click.option("--branch-name", default=None)
+@click.option("--base-ref", default="HEAD")
+@click.option("--keep-worktrees", is_flag=True)
+@click.option("--auto-approve", is_flag=True, help="Skip the approval prompt.")
 @click.option("--json", "as_json", is_flag=True, help="Output the final RunResult as JSON.")
-@click.option("--timeout-per-agent", default=1500, type=int, help="Seconds per agent invocation.")
+@click.option("--timeout-per-agent", default=1500, type=int)
 @click.option("--max-diff-lines", default=1000, type=int)
+@click.option(
+    "--repo-root",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=".",
+)
 def run_cmd(  # noqa: PLR0913
     prompt: str,
     writer_cli: str,
@@ -54,26 +84,94 @@ def run_cmd(  # noqa: PLR0913
     branch_name: str | None,
     base_ref: str,
     keep_worktrees: bool,
-    stream: bool,
     auto_approve: bool,
     as_json: bool,
     timeout_per_agent: int,
     max_diff_lines: int,
+    repo_root: Path,
 ) -> None:
     """Run one dialectic pass on a prompt."""
-    raise NotImplementedError("Wire up to core.run / core.run_streaming.")
+    if dry_run_shortcut:
+        apply_mode = "dry_run"
+
+    config = RunConfig(
+        prompt=prompt,
+        writer=AgentConfig(cli=AgentCli(writer_cli), model=writer_model, effort=writer_effort),
+        reviewer=AgentConfig(
+            cli=AgentCli(reviewer_cli), model=reviewer_model, effort=reviewer_effort
+        ),
+        max_revisions=max_revisions,
+        apply_mode=ApplyMode(apply_mode),
+        branch_name=branch_name,
+        base_ref=base_ref,
+        keep_worktrees=keep_worktrees,
+        timeout_per_agent_s=timeout_per_agent,
+        max_diff_lines=max_diff_lines,
+        sandbox=SandboxMode.WORKSPACE_WRITE,
+    )
+
+    repo_root = repo_root.resolve()
+    console.print(
+        f"[bold]dialectic[/bold] · writer={writer_cli}({writer_model}, {writer_effort}) "
+        f"reviewer={reviewer_cli}({reviewer_model}, {reviewer_effort})"
+    )
+    console.print(f"[dim]repo: {repo_root}  base_ref: {base_ref}  max_revisions: {max_revisions}[/dim]")
+
+    with console.status("Running dialectic protocol..."):
+        result = asyncio.run(core.run(config, repo_root))
+
+    if as_json:
+        click.echo(result.model_dump_json(indent=2))
+        return
+
+    _render_result(result)
+
+    if result.status == RunStatus.FAILED:
+        sys.exit(1)
+    if result.status == RunStatus.AWAITING_ARBITRATION:
+        console.print(
+            f"\n[yellow]Run {result.run_id} has {len(result.disputed_items)} disputed item(s). "
+            f"Resolve with:[/yellow]"
+        )
+        console.print(f"  dialectic arbitrate {result.run_id} --accept-writer ID ...")
+        return
+    if not auto_approve:
+        choice = click.prompt(
+            "\napprove / reject / view (a/r/v)?",
+            type=click.Choice(["a", "r", "v"]),
+            default="v",
+        )
+        if choice == "v":
+            console.print(
+                Syntax(result.diff or "(empty diff)", "diff", theme="ansi_dark", line_numbers=False)
+            )
+            choice = click.prompt("approve / reject? (a/r)", type=click.Choice(["a", "r"]), default="r")
+        if choice == "r":
+            core.reject_run_result(result, repo_root)
+            console.print(f"[red]Rejected. Audit log: {result.audit_log_path}[/red]")
+            return
+    try:
+        result = core.apply_run_result(result, repo_root)
+    except Exception as exc:
+        console.print(f"[red]Apply failed: {exc}[/red]")
+        sys.exit(1)
+
+    _render_apply_summary(result, repo_root)
 
 
 @main.command()
 @click.argument("run_id")
 @click.option("--repo-root", type=click.Path(exists=True, file_okay=False, path_type=Path), default=".")
 def approve(run_id: str, repo_root: Path) -> None:
-    """Apply a previously-completed run's diff.
-
-    Loads the persisted RunResult via core.load_run_record, then calls core.apply_run_result.
-    Refuses if the run has unresolved disputed_items (use `dialectic arbitrate` first).
-    """
-    raise NotImplementedError
+    """Apply a previously-completed run's diff."""
+    repo_root = repo_root.resolve()
+    result = core.load_run_record(run_id, repo_root)
+    try:
+        result = core.apply_run_result(result, repo_root)
+    except Exception as exc:
+        console.print(f"[red]Apply failed: {exc}[/red]")
+        sys.exit(1)
+    _render_apply_summary(result, repo_root)
 
 
 @main.command()
@@ -81,33 +179,18 @@ def approve(run_id: str, repo_root: Path) -> None:
 @click.option("--repo-root", type=click.Path(exists=True, file_okay=False, path_type=Path), default=".")
 def reject(run_id: str, repo_root: Path) -> None:
     """Discard a previously-completed run."""
-    raise NotImplementedError
+    repo_root = repo_root.resolve()
+    result = core.load_run_record(run_id, repo_root)
+    core.reject_run_result(result, repo_root)
+    console.print(f"[red]Rejected {run_id}. Audit log: {result.audit_log_path}[/red]")
 
 
 @main.command()
 @click.argument("run_id")
-@click.option(
-    "--accept-writer",
-    "accept_writer",
-    multiple=True,
-    type=int,
-    help="Item IDs where you side with the writer (repeatable).",
-)
-@click.option(
-    "--accept-reviewer",
-    "accept_reviewer",
-    multiple=True,
-    type=int,
-    help="Item IDs where you side with the reviewer (repeatable).",
-)
-@click.option(
-    "--skip",
-    "skip_items",
-    multiple=True,
-    type=int,
-    help="Item IDs to ship as-is and note as unresolved in audit log (repeatable).",
-)
-@click.option("--note", default=None, help="Optional note attached to all decisions.")
+@click.option("--accept-writer", "accept_writer", multiple=True, type=int)
+@click.option("--accept-reviewer", "accept_reviewer", multiple=True, type=int)
+@click.option("--skip", "skip_items", multiple=True, type=int)
+@click.option("--note", default=None)
 @click.option("--repo-root", type=click.Path(exists=True, file_okay=False, path_type=Path), default=".")
 def arbitrate(  # noqa: PLR0913
     run_id: str,
@@ -117,14 +200,33 @@ def arbitrate(  # noqa: PLR0913
     note: str | None,
     repo_root: Path,
 ) -> None:
-    """Resolve disputed items in a run, then surface the final diff for approval.
-
-    Wraps core.resume_with_arbitration. The union of --accept-writer / --accept-reviewer
-    / --skip must cover all disputed_items in the run; missing items will error.
-
-    After arbitration, the run moves to AWAITING_APPROVAL — run `dialectic approve <id>` to apply.
-    """
-    raise NotImplementedError
+    """Resolve disputed items in a run."""
+    repo_root = repo_root.resolve()
+    decisions: list[ArbitrationDecision] = []
+    for item_id in accept_writer:
+        decisions.append(
+            ArbitrationDecision(item_id=item_id, choice=ArbitrationChoice.ACCEPT_WRITER, note=note)
+        )
+    for item_id in accept_reviewer:
+        decisions.append(
+            ArbitrationDecision(
+                item_id=item_id, choice=ArbitrationChoice.ACCEPT_REVIEWER, note=note
+            )
+        )
+    for item_id in skip_items:
+        decisions.append(
+            ArbitrationDecision(item_id=item_id, choice=ArbitrationChoice.SKIP, note=note)
+        )
+    try:
+        result = asyncio.run(core.resume_with_arbitration(run_id, decisions, repo_root))
+    except Exception as exc:
+        console.print(f"[red]Arbitration failed: {exc}[/red]")
+        sys.exit(1)
+    console.print(
+        f"[green]Arbitration recorded. Run {run_id} now awaiting approval — "
+        f"`dialectic approve {run_id}` to apply.[/green]"
+    )
+    _render_result(result)
 
 
 @main.command()
@@ -135,6 +237,69 @@ def serve(host: str, port: int) -> None:
     from . import server
 
     server.run(host=host, port=port)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Rendering helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _render_result(result: RunResult) -> None:
+    status_color = {
+        RunStatus.AWAITING_APPROVAL: "green",
+        RunStatus.AWAITING_ARBITRATION: "yellow",
+        RunStatus.FAILED: "red",
+        RunStatus.TIMED_OUT: "red",
+    }.get(result.status, "white")
+    header = (
+        f"[bold]Run {result.run_id}[/bold]  "
+        f"[{status_color}]{result.status.value}[/{status_color}]  "
+        f"·  {result.duration_s:.1f}s  ·  ${result.cost_usd:.4f}"
+    )
+    console.print()
+    console.print(Panel(header, expand=False, border_style="bright_black"))
+    if result.summary:
+        console.print(f"[dim]{result.summary}[/dim]")
+
+    if result.files_changed:
+        console.print(f"\n[bold]Files changed ({len(result.files_changed)}):[/bold]")
+        for f in result.files_changed:
+            console.print(f"  · {f}")
+
+    if result.acknowledged_dissents:
+        console.print(
+            f"\n[bold yellow]Acknowledged dissents ({len(result.acknowledged_dissents)}):[/bold yellow]"
+        )
+        for d in result.acknowledged_dissents:
+            console.print(f"  · #{d.item.id}  {d.item.issue}")
+            console.print(f"    [dim]writer: {d.writer_response.rationale}[/dim]")
+
+    if result.disputed_items:
+        console.print(
+            f"\n[bold red]Disputed items ({len(result.disputed_items)}) — need user arbitration:[/bold red]"
+        )
+        for d in result.disputed_items:
+            loc = f"{d.item.file}:{d.item.lines}" if d.item.lines else (d.item.file or "")
+            console.print(f"  · #{d.item.id} [{d.item.severity.value}] {loc}")
+            console.print(f"    issue:   {d.item.issue}")
+            console.print(f"    writer:  {d.writer_response.rationale}")
+            console.print(f"    reviewer: {d.reviewer_rebuttal_item.rebuttal_reasoning}")
+
+    if result.error:
+        console.print(f"\n[red]Error:[/red] {result.error}")
+
+
+def _render_apply_summary(result: RunResult, repo_root: Path) -> None:
+    if result.config.apply_mode.value == "branch":
+        msg = f"[green]✓ Applied {len(result.files_changed)} file(s) on new branch.[/green]"
+    elif result.config.apply_mode.value == "dry_run":
+        msg = f"[green]✓ Dry run complete. Audit log: {result.audit_log_path}[/green]"
+    else:
+        msg = (
+            f"[green]✓ Applied {len(result.files_changed)} file(s) to your working tree (uncommitted).\n"
+            f"  Run `git diff` to review, then commit when ready.[/green]"
+        )
+    console.print(f"\n{msg}")
 
 
 if __name__ == "__main__":
