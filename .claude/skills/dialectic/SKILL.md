@@ -11,11 +11,14 @@ You are dispatching a coding task to the `dialectic` orchestrator. The orchestra
 
 1. **Run the orchestrator:**
    ```
-   dialectic run --prompt "$ARGS" --stream
+   dialectic run --prompt "$ARGS"
    ```
-   `$ARGS` is the user's prompt after `/dialectic`. Quote it.
+   `$ARGS` is the user's prompt after `/dialectic`. Quote it. The CLI streams
+   per-phase progress events to stdout by default (writer started/done,
+   reviewer started/done, revision started/done, rebuttal started/done,
+   run finished); pipe through to the user as they arrive — do NOT batch.
 
-2. **Stream events to the user as they arrive.** The orchestrator emits one event per line (JSON if `--stream --json`, otherwise human-readable). Display them in real time so the user can see progress (`Writer reading src/foo.py...`, `Reviewer analyzing diff (3 files)...`, `Writer revising 2 items, defending 1...`). Do NOT batch.
+2. **Stream events to the user as they arrive.** The orchestrator emits one human-readable line per phase to stdout. Show them in real time so the user can see progress; do NOT collect everything and dump at the end.
 
 3. **At end-of-run** the orchestrator persists a `RunResult` and prints its `run_id` + summary. Inspect `RunResult.status`:
 
