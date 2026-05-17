@@ -942,6 +942,15 @@ def apply_run_result(result: RunResult, repo_root: Path) -> RunResult:
             "`dialectic arbitrate` first)."
         )
 
+    # Refuse if user is mid-rebase / mid-merge / etc. Applying then would corrupt
+    # the operation state.
+    in_progress = wt.in_progress_git_operation(repo_root)
+    if in_progress:
+        raise RuntimeError(
+            f"Refusing to apply: git operation {in_progress!r} in progress. "
+            "Finish (or abort) the rebase/merge/cherry-pick first."
+        )
+
     # Use the SHA captured at run-start, not a fresh resolution of base_ref.
     # If we re-resolved "HEAD" here it'd be tautologically equal to current_head
     # even after the user has switched branches or committed something else.

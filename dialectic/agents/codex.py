@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import os
 import re
 import time
 from copy import deepcopy
@@ -13,6 +15,8 @@ from typing import Any, AsyncIterator
 from pydantic import BaseModel
 
 from ..protocol import AgentConfig, SandboxMode, StreamEvent
+
+logger = logging.getLogger("dialectic.agents.codex")
 
 
 class CodexInvocation(BaseModel):
@@ -74,7 +78,9 @@ async def invoke(invocation: CodexInvocation, timeout_s: int = 1500) -> CodexRes
     for d in invocation.additional_dirs:
         cmd.extend(["--add-dir", str(d)])
 
-    cmd.append(invocation.prompt)
+    # `--` separator so a prompt that happens to start with `-` is unambiguously
+    # treated as a positional, not a flag.
+    cmd.extend(["--", invocation.prompt])
 
     start = time.monotonic()
     try:
@@ -84,12 +90,21 @@ async def invoke(invocation: CodexInvocation, timeout_s: int = 1500) -> CodexRes
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(invocation.cwd),
+            env=os.environ.copy(),
         )
         try:
             stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
         except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
+            # Graceful SIGTERM, fallback to SIGKILL.
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                proc.kill()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=10)
+                except asyncio.TimeoutError:
+                    pass
             return CodexResult(
                 raw_text="",
                 duration_s=time.monotonic() - start,
@@ -174,7 +189,10 @@ def _parse_codex_jsonl(stdout: str) -> dict[str, Any]:
             output_tokens += int(usage.get("output_tokens") or 0)
         elif et in ("error", "turn.failed"):
             err = event.get("error") or {}
-            error_msg = err.get("message") if isinstance(err, dict) else str(err) or str(event)
+            if isinstance(err, dict):
+                error_msg = err.get("message") or str(err) or str(event)
+            else:
+                error_msg = str(err) or str(event)
 
     return {
         "final_text": final_text,
@@ -209,6 +227,12 @@ def _compute_codex_cost(
 ) -> float:
     pricing = _CODEX_PRICING.get(model)
     if not pricing:
+        if input_tokens or output_tokens:
+            logger.warning(
+                "No pricing entry for codex model %r; cost reported as $0.00 "
+                "(tokens: in=%d cached=%d out=%d). Add to _CODEX_PRICING.",
+                model, input_tokens, cached_input_tokens, output_tokens,
+            )
         return 0.0
     uncached_input = max(0, input_tokens - cached_input_tokens)
     return (
@@ -240,8 +264,21 @@ def _make_strict_schema(schema: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+# OpenAI strict-mode's `format` whitelist is narrow. Anything else trips schema
+# validation. We drop unknown formats defensively.
+_STRICT_FORMAT_WHITELIST = frozenset({"date-time"})
+
+
 def _strict_walk(node: Any) -> None:
     if isinstance(node, dict):
+        # Drop unsupported `format` keys (e.g. "path" from pydantic Path fields).
+        fmt = node.get("format")
+        if isinstance(fmt, str) and fmt not in _STRICT_FORMAT_WHITELIST:
+            del node["format"]
+
+        # Flatten anyOf [<simple-type>, null] patterns into type-array form, only
+        # when the two-branch structure permits it. 3+ branch unions, oneOf, and
+        # anyOf-with-$ref-and-null are left alone (OpenAI accepts them as-is).
         any_of = node.get("anyOf")
         if isinstance(any_of, list) and len(any_of) == 2:
             non_nulls = [s for s in any_of if not _is_null_schema(s)]
@@ -261,9 +298,20 @@ def _strict_walk(node: Any) -> None:
                     elif k not in node:
                         node[k] = v
 
-        if "properties" in node and isinstance(node["properties"], dict):
-            node["additionalProperties"] = False
-            node["required"] = list(node["properties"].keys())
+        # Object schemas: enforce additionalProperties: false and require every
+        # property. We also handle the legitimate-but-rare "type: object with no
+        # properties" case (e.g. `dict[str, Any]`) by forcing `properties: {}` +
+        # `required: []` so the schema is well-formed for strict mode (OpenAI
+        # rejects bare `additionalProperties: true` in strict).
+        is_object = node.get("type") == "object" or "properties" in node
+        if is_object:
+            if "properties" in node and isinstance(node["properties"], dict):
+                node["additionalProperties"] = False
+                node["required"] = list(node["properties"].keys())
+            elif node.get("type") == "object":
+                node.setdefault("properties", {})
+                node["required"] = []
+                node["additionalProperties"] = False
 
         for value in node.values():
             _strict_walk(value)
@@ -273,4 +321,10 @@ def _strict_walk(node: Any) -> None:
 
 
 def _is_null_schema(s: Any) -> bool:
-    return isinstance(s, dict) and s.get("type") == "null" and len(s) == 1
+    """A schema fragment that means 'null'. Tolerates harmless extras like `title`."""
+    if not isinstance(s, dict):
+        return False
+    if s.get("type") != "null":
+        return False
+    extras = set(s.keys()) - {"type", "title", "description"}
+    return not extras

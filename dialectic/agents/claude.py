@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from pathlib import Path
 from typing import AsyncIterator
@@ -42,8 +43,6 @@ async def invoke(invocation: ClaudeInvocation, timeout_s: int = 1500) -> ClaudeR
     """
     cmd: list[str] = [
         "claude",
-        "-p",
-        invocation.prompt,
         "--model",
         invocation.config.model,
         "--effort",
@@ -69,6 +68,13 @@ async def invoke(invocation: ClaudeInvocation, timeout_s: int = 1500) -> ClaudeR
     if invocation.max_budget_usd is not None:
         cmd.extend(["--max-budget-usd", str(invocation.max_budget_usd)])
 
+    # `-p` flag with the prompt as final positional. Some CLIs treat any positional
+    # starting with `-` as a flag; we never pass `--` separator (claude doesn't
+    # support end-of-options) but always pass the prompt as the LAST argv element
+    # so flag-style prompts can only be misparsed by the CLI's own argparse, not
+    # by us bleeding into other flag values.
+    cmd.extend(["-p", invocation.prompt])
+
     start = time.monotonic()
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -77,12 +83,21 @@ async def invoke(invocation: ClaudeInvocation, timeout_s: int = 1500) -> ClaudeR
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(invocation.cwd),
+            env=os.environ.copy(),
         )
         try:
             stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
         except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
+            # Graceful SIGTERM first, give it 5s, then SIGKILL.
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                proc.kill()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=10)
+                except asyncio.TimeoutError:
+                    pass  # Best effort.
             return ClaudeResult(
                 raw_text="",
                 duration_s=time.monotonic() - start,
@@ -98,9 +113,10 @@ async def invoke(invocation: ClaudeInvocation, timeout_s: int = 1500) -> ClaudeR
         )
 
     duration = time.monotonic() - start
-    stdout = stdout_b.decode("utf-8", errors="replace")
+    stdout = stdout_b.decode("utf-8", errors="replace").lstrip("﻿")  # tolerate BOM
     stderr = stderr_b.decode("utf-8", errors="replace")
 
+    # Surface nonzero exits even if stdout had something (could be a partial result).
     if proc.returncode != 0 and not stdout.strip():
         return ClaudeResult(
             raw_text=stdout,
@@ -109,8 +125,16 @@ async def invoke(invocation: ClaudeInvocation, timeout_s: int = 1500) -> ClaudeR
             error=stderr.strip() or f"exit code {proc.returncode}",
         )
 
+    # Tolerate any pre-JSON noise (update banners, ANSI codes) by finding the first '{'.
+    parse_target = stdout
+    first_brace = stdout.find("{")
+    if first_brace > 0 and not stdout[:first_brace].strip():
+        parse_target = stdout
+    elif first_brace > 0:
+        parse_target = stdout[first_brace:]
+
     try:
-        data = json.loads(stdout)
+        data = json.loads(parse_target)
     except json.JSONDecodeError as exc:
         return ClaudeResult(
             raw_text=stdout,
@@ -119,8 +143,17 @@ async def invoke(invocation: ClaudeInvocation, timeout_s: int = 1500) -> ClaudeR
             error=f"JSON parse error: {exc}; first 500 chars of stdout: {stdout[:500]!r}",
         )
 
+    # `errors` may contain dicts ({"code", "message"}) or strings; extract message.
     errors_field = data.get("errors") or []
-    error_msg = str(errors_field[0]) if errors_field else None
+    error_msg: str | None = None
+    if errors_field:
+        first = errors_field[0]
+        if isinstance(first, dict):
+            error_msg = first.get("message") or str(first)
+        else:
+            error_msg = str(first)
+
+    is_error_flag = bool(data.get("is_error", False)) or proc.returncode != 0
 
     return ClaudeResult(
         raw_text=data.get("result", ""),
@@ -128,8 +161,8 @@ async def invoke(invocation: ClaudeInvocation, timeout_s: int = 1500) -> ClaudeR
         cost_usd=float(data.get("total_cost_usd") or 0.0),
         duration_s=duration,
         session_id=data.get("session_id"),
-        is_error=bool(data.get("is_error", False)),
-        error=error_msg,
+        is_error=is_error_flag,
+        error=error_msg or (stderr.strip() if is_error_flag and stderr.strip() else None),
     )
 
 

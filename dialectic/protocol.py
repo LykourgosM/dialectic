@@ -150,7 +150,7 @@ class ArbitrationChoice(str, Enum):
 
 
 class _Strict(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

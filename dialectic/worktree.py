@@ -64,15 +64,73 @@ def working_tree_is_clean(repo_root: Path, *, ignore_dialectic: bool = True) -> 
     By default ignores anything under `.dialectic/` since those are orchestrator-managed
     artifacts (audit logs, context files, transient worktrees) — they're not part of
     "user-facing dirty state" the safety check is guarding against.
+
+    Uses NUL-delimited porcelain output to handle paths with spaces, newlines,
+    and rename arrows ('R  old -> new') correctly.
     """
-    for line in _git(repo_root, "status", "--porcelain").splitlines():
-        if not line.strip():
+    # -z gives NUL-delimited entries. For renames/copies it's `XY old\0new\0` so
+    # we step through carefully.
+    raw = _git(repo_root, "status", "--porcelain", "-z")
+    if not raw:
+        return True
+    entries = raw.split("\x00")
+    idx = 0
+    while idx < len(entries):
+        entry = entries[idx]
+        if not entry:
+            idx += 1
             continue
-        path = line[3:] if len(line) > 3 else ""
-        if ignore_dialectic and (path == ".dialectic" or path.startswith(".dialectic/")):
+        status = entry[:2]
+        path = entry[3:] if len(entry) > 3 else ""
+        # Renames/copies: status is 'R*' or 'C*'; the next NUL-delimited token is the old path.
+        is_rename = status[0] in ("R", "C") or (len(status) > 1 and status[1] in ("R", "C"))
+        if is_rename and idx + 1 < len(entries):
+            # entry = "R  new", next = "old"
+            old_path = entries[idx + 1]
+            idx += 2
+            # If EITHER side of the rename is outside .dialectic/, the tree is dirty.
+            if ignore_dialectic and _is_dialectic_path(path) and _is_dialectic_path(old_path):
+                continue
+            return False
+        idx += 1
+        if ignore_dialectic and _is_dialectic_path(path):
             continue
         return False
     return True
+
+
+def _is_dialectic_path(path: str) -> bool:
+    return path == ".dialectic" or path.startswith(".dialectic/")
+
+
+_GIT_OPERATION_FILES = (
+    "rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD",
+    "BISECT_LOG", "REVERT_HEAD",
+)
+
+
+def in_progress_git_operation(repo_root: Path) -> str | None:
+    """Return the name of any in-progress git operation (rebase, merge, etc.), or None.
+
+    Applying a diff during mid-rebase/merge would corrupt the operation state; better
+    to refuse early with a clear message.
+    """
+    git_dir = repo_root / ".git"
+    if not git_dir.is_dir():
+        # Could be a worktree (.git is a file pointing at the real gitdir).
+        if git_dir.is_file():
+            try:
+                gitfile = git_dir.read_text().strip()
+                if gitfile.startswith("gitdir: "):
+                    git_dir = Path(gitfile[len("gitdir: ") :])
+            except OSError:
+                return None
+        else:
+            return None
+    for name in _GIT_OPERATION_FILES:
+        if (git_dir / name).exists():
+            return name
+    return None
 
 
 def current_branch_name(repo_root: Path) -> str:
@@ -129,7 +187,10 @@ def worktree_pair(
     failed = False
     try:
         yield pair
-    except Exception:
+    except BaseException:
+        # Catch BaseException (not just Exception) so KeyboardInterrupt and
+        # asyncio.CancelledError also trigger keep-on-failure. Without this,
+        # Ctrl-C silently deletes the worktree even with --keep-worktrees.
         failed = True
         raise
     finally:
