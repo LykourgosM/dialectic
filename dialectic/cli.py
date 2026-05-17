@@ -117,8 +117,25 @@ def run_cmd(  # noqa: PLR0913
     )
     console.print(f"[dim]repo: {repo_root}  base_ref: {base_ref}  max_revisions: {max_revisions}[/dim]")
 
-    with console.status("Running dialectic protocol..."):
-        result = asyncio.run(core.run(config, repo_root))
+    from .protocol import EventType, StreamEvent
+
+    def render_event(ev: StreamEvent) -> None:
+        prefix = {
+            EventType.RUN_STARTED: "[bold cyan]●[/bold cyan]",
+            EventType.WRITER_STARTED: "[blue]→[/blue]",
+            EventType.WRITER_DONE: "[green]✓[/green]",
+            EventType.REVIEWER_STARTED: "[blue]→[/blue]",
+            EventType.REVIEWER_DONE: "[green]✓[/green]",
+            EventType.REVISION_STARTED: "[blue]→[/blue]",
+            EventType.REVISION_DONE: "[green]✓[/green]",
+            EventType.REBUTTAL_STARTED: "[blue]→[/blue]",
+            EventType.REBUTTAL_DONE: "[green]✓[/green]",
+            EventType.RUN_FINISHED: "[bold cyan]●[/bold cyan]",
+            EventType.ERROR: "[red]✗[/red]",
+        }.get(ev.event_type, "·")
+        console.print(f"{prefix} {ev.message}")
+
+    result = asyncio.run(core.run(config, repo_root, on_event=render_event))
 
     if as_json:
         click.echo(result.model_dump_json(indent=2))

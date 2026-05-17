@@ -807,6 +807,84 @@ async def test_invariant_writer_missing_response_caught(tmp_git_repo: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_stream_events_emitted_in_expected_order(tmp_git_repo: Path) -> None:
+    """on_event callback fires for RUN_STARTED → WRITER → REVIEWER → RUN_FINISHED."""
+    events: list[p.StreamEvent] = []
+
+    async def fake_writer(prompt, cfg, cwd, schema, perm, timeout):
+        (cwd / "main.py").write_text("changed\n")
+        return claude_ok(writer_report_dict())
+
+    async def fake_reviewer(prompt, cfg, cwd, schema, sandbox, timeout):
+        return codex_ok(critique_dict("approve", []))
+
+    await core.run(
+        p.RunConfig(prompt="x"),
+        tmp_git_repo,
+        writer_invoke=fake_writer,
+        reviewer_invoke=fake_reviewer,
+        on_event=events.append,
+    )
+
+    event_types = [e.event_type for e in events]
+    assert p.EventType.RUN_STARTED in event_types
+    assert p.EventType.WRITER_STARTED in event_types
+    assert p.EventType.WRITER_DONE in event_types
+    assert p.EventType.REVIEWER_STARTED in event_types
+    assert p.EventType.REVIEWER_DONE in event_types
+    assert p.EventType.RUN_FINISHED in event_types
+    # First event is RUN_STARTED, last is RUN_FINISHED
+    assert events[0].event_type == p.EventType.RUN_STARTED
+    assert events[-1].event_type == p.EventType.RUN_FINISHED
+    # Writer events come before reviewer events
+    assert event_types.index(p.EventType.WRITER_STARTED) < event_types.index(p.EventType.REVIEWER_STARTED)
+
+
+@pytest.mark.asyncio
+async def test_stream_events_include_revision_and_rebuttal(tmp_git_repo: Path) -> None:
+    events: list[p.StreamEvent] = []
+    writer_calls = 0
+
+    async def fake_writer(prompt, cfg, cwd, schema, perm, timeout):
+        nonlocal writer_calls
+        writer_calls += 1
+        if writer_calls == 1:
+            (cwd / "main.py").write_text("changed\n")
+            return claude_ok(writer_report_dict())
+        return claude_ok(
+            writer_responses_dict([{"item_id": 1, "action": "reject", "rationale": "no"}])
+        )
+
+    reviewer_calls = 0
+
+    async def fake_reviewer(prompt, cfg, cwd, schema, sandbox, timeout):
+        nonlocal reviewer_calls
+        reviewer_calls += 1
+        if reviewer_calls == 1:
+            return codex_ok(critique_dict("revise", [critique_item_dict(1, "x", severity="medium")]))
+        return codex_ok(
+            rebuttal_dict(
+                "approve_with_dissent",
+                [{"item_id": 1, "verdict": "accept_writer_rationale"}],
+            )
+        )
+
+    await core.run(
+        p.RunConfig(prompt="x", max_revisions=1),
+        tmp_git_repo,
+        writer_invoke=fake_writer,
+        reviewer_invoke=fake_reviewer,
+        on_event=events.append,
+    )
+
+    event_types = [e.event_type for e in events]
+    assert p.EventType.REVISION_STARTED in event_types
+    assert p.EventType.REVISION_DONE in event_types
+    assert p.EventType.REBUTTAL_STARTED in event_types
+    assert p.EventType.REBUTTAL_DONE in event_types
+
+
+@pytest.mark.asyncio
 async def test_diff_exceeds_max_lines_aborts(tmp_git_repo: Path) -> None:
     async def fake_writer(prompt, cfg, cwd, schema, perm, timeout):
         # Write a huge file

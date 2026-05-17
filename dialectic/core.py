@@ -29,6 +29,7 @@ from .protocol import (
     ClaudePermissionMode,
     CritiqueItem,
     DisputedItem,
+    EventType,
     ItemRebuttalVerdict,
     RebuttalVerdict,
     ReviewerCritique,
@@ -447,10 +448,26 @@ async def run(
     *,
     writer_invoke: Any | None = None,
     reviewer_invoke: Any | None = None,
+    on_event: Callable[[StreamEvent], None] | None = None,
 ) -> RunResult:
-    """Execute one full dialectic run. Returns a RunResult; does NOT apply the diff."""
+    """Execute one full dialectic run. Returns a RunResult; does NOT apply the diff.
+
+    If `on_event` is provided, it is called synchronously with each StreamEvent
+    as the dance progresses (RUN_STARTED, WRITER_STARTED/DONE, REVIEWER_STARTED/DONE,
+    REVISION_STARTED/DONE, REBUTTAL_STARTED/DONE, DIFF_READY, RUN_FINISHED, ERROR).
+    """
     run_id = _gen_run_id()
     started_at = datetime.now(timezone.utc)
+
+    def emit(event_type: EventType, message: str = "", payload: dict[str, Any] | None = None) -> None:
+        if on_event is None:
+            return
+        try:
+            on_event(StreamEvent(
+                event_type=event_type, run_id=run_id, message=message, payload=payload or {},
+            ))
+        except Exception as exc:  # never let event handlers break the run
+            logger.warning("on_event handler raised: %s", exc)
 
     writer_inv = _invoker_for(config.writer.cli, override=writer_invoke)
     reviewer_inv = _invoker_for(config.reviewer.cli, override=reviewer_invoke)
@@ -469,6 +486,12 @@ async def run(
 
     total_cost = 0.0
     rounds: list[RevisionRound] = []
+
+    emit(EventType.RUN_STARTED, f"Starting run {run_id}", {
+        "writer": f"{config.writer.cli.value}/{config.writer.model}/{config.writer.effort}",
+        "reviewer": f"{config.reviewer.cli.value}/{config.reviewer.model}/{config.reviewer.effort}",
+        "max_revisions": config.max_revisions,
+    })
 
     try:
         with wt.worktree_pair(
@@ -494,6 +517,8 @@ async def run(
                     )
                     writer_call_kwargs = {"permission_mode": ClaudePermissionMode.BYPASS}
 
+                phase_label = "writer_initial" if round_num == 1 else "writer_continuation"
+                emit(EventType.WRITER_STARTED, f"Round {round_num}: writer ({config.writer.cli.value})")
                 writer_result = await _invoke_logged(
                     writer_inv,
                     cli=config.writer.cli,
@@ -507,11 +532,17 @@ async def run(
                     timeout_s=config.timeout_per_agent_s,
                     repo_root=repo_root,
                     run_id=run_id,
-                    phase="writer_initial" if round_num == 1 else "writer_continuation",
+                    phase=phase_label,
                     round_num=round_num,
                     role="writer",
                 )
                 total_cost += float(writer_result.cost_usd or 0.0)
+                emit(
+                    EventType.WRITER_DONE,
+                    f"Round {round_num}: writer done (${writer_result.cost_usd:.4f}, "
+                    f"{writer_result.duration_s:.1f}s)",
+                    {"cost_usd": writer_result.cost_usd, "duration_s": writer_result.duration_s},
+                )
                 if writer_result.is_error:
                     raise RuntimeError(f"Writer failed: {writer_result.error}")
 
@@ -536,6 +567,7 @@ async def run(
                 reviewer_prompt = _build_reviewer_critique_prompt(
                     config.prompt, writer_report, authoritative_diff, project_context
                 )
+                emit(EventType.REVIEWER_STARTED, f"Round {round_num}: reviewer ({config.reviewer.cli.value})")
                 reviewer_result = await _invoke_logged(
                     reviewer_inv,
                     cli=config.reviewer.cli,
@@ -557,6 +589,12 @@ async def run(
 
                 critique = _coerce_structured(reviewer_result.structured, ReviewerCritique)
                 _validate_critique_unique_ids(critique)
+                emit(
+                    EventType.REVIEWER_DONE,
+                    f"Round {round_num}: reviewer verdict={critique.verdict.value} "
+                    f"({len(critique.items)} items, ${reviewer_result.cost_usd:.4f})",
+                    {"verdict": critique.verdict.value, "items": len(critique.items)},
+                )
                 round_obj = RevisionRound(
                     round_number=round_num,
                     writer_report=writer_report,
@@ -592,6 +630,10 @@ async def run(
                     authoritative_diff,
                     project_context,
                 )
+                emit(
+                    EventType.REVISION_STARTED,
+                    f"Round {round_num}: writer responding to {len(critique.items)} item(s)",
+                )
                 writer_revision_result = await _invoke_logged(
                     writer_inv,
                     cli=config.writer.cli,
@@ -615,6 +657,14 @@ async def run(
                 )
                 _validate_response_covers_critique(response_bundle, critique)
                 round_obj.writer_responses = response_bundle
+                n_accept = sum(1 for r in response_bundle.responses if r.action == WriterAction.ACCEPT)
+                n_reject = len(response_bundle.responses) - n_accept
+                emit(
+                    EventType.REVISION_DONE,
+                    f"Round {round_num}: writer accepted {n_accept}, defended {n_reject} "
+                    f"(${writer_revision_result.cost_usd:.4f})",
+                    {"accepted": n_accept, "rejected": n_reject},
+                )
 
                 revised_diff = wt.extract_diff(pair)
                 if len(revised_diff.splitlines()) > config.max_diff_lines:
@@ -628,6 +678,10 @@ async def run(
 
                 if rejected_responses:
                     # ─── REVIEWER REBUTTAL ───
+                    emit(
+                        EventType.REBUTTAL_STARTED,
+                        f"Round {round_num}: reviewer rebutting {len(rejected_responses)} defended item(s)",
+                    )
                     rebuttal_prompt = _build_reviewer_rebuttal_prompt(
                         config.prompt,
                         writer_report,
@@ -657,6 +711,16 @@ async def run(
                     rebuttal = _coerce_structured(rebuttal_result.structured, ReviewerRebuttal)
                     _validate_rebuttal_covers_rejections(rebuttal, response_bundle)
                     round_obj.reviewer_rebuttal = rebuttal
+                    n_still = sum(
+                        1
+                        for r in rebuttal.item_rebuttals
+                        if r.verdict == ItemRebuttalVerdict.STILL_DISPUTED
+                    )
+                    emit(
+                        EventType.REBUTTAL_DONE,
+                        f"Round {round_num}: rebuttal verdict={rebuttal.verdict.value} "
+                        f"({n_still} still disputed, ${rebuttal_result.cost_usd:.4f})",
+                    )
                     rounds.append(round_obj)
 
                     # If reviewer approves (no still_disputed at item level), we're done.
@@ -700,6 +764,12 @@ async def run(
             result.summary = _build_summary(rounds, disputed, dissents)
 
         result.audit_log_path = str(persist_run_record(result, repo_root))
+
+        emit(
+            EventType.RUN_FINISHED,
+            f"Run {run_id} {result.status.value} (${result.cost_usd:.4f}, {result.duration_s:.1f}s)",
+            {"status": result.status.value, "cost_usd": result.cost_usd},
+        )
 
     return result
 
