@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from dialectic.agents.codex import _make_strict_schema, _is_null_schema
+from dialectic.agents.codex import _is_null_schema, _make_strict_schema
 from dialectic.protocol import CritiqueItem, ReviewerCritique, WriterReport
 
 

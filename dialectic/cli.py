@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import click
@@ -59,7 +58,9 @@ def main(verbose: int) -> None:
     type=click.Choice(["uncommitted", "branch", "dry_run"]),
     default="uncommitted",
 )
-@click.option("--dry-run", "dry_run_shortcut", is_flag=True, help="Shortcut for --apply-mode dry_run.")
+@click.option(
+    "--dry-run", "dry_run_shortcut", is_flag=True, help="Shortcut for --apply-mode dry_run."
+)
 @click.option("--branch-name", default=None)
 @click.option("--base-ref", default="HEAD")
 @click.option("--keep-worktrees", is_flag=True)
@@ -72,7 +73,7 @@ def main(verbose: int) -> None:
     type=click.Path(exists=True, file_okay=False, path_type=Path),
     default=".",
 )
-def run_cmd(  # noqa: PLR0913
+def run_cmd(
     prompt: str,
     writer_cli: str,
     writer_model: str,
@@ -117,7 +118,9 @@ def run_cmd(  # noqa: PLR0913
         f"[bold]dialectic[/bold] · writer={writer_cli}({writer_model}, {writer_effort}) "
         f"reviewer={reviewer_cli}({reviewer_model}, {reviewer_effort})"
     )
-    console.print(f"[dim]repo: {repo_root}  base_ref: {base_ref}  max_revisions: {max_revisions}[/dim]")
+    console.print(
+        f"[dim]repo: {repo_root}  base_ref: {base_ref}  max_revisions: {max_revisions}[/dim]"
+    )
 
     from .protocol import EventType, StreamEvent
 
@@ -164,7 +167,9 @@ def run_cmd(  # noqa: PLR0913
             console.print(
                 Syntax(result.diff or "(empty diff)", "diff", theme="ansi_dark", line_numbers=False)
             )
-            choice = click.prompt("approve / reject? (a/r)", type=click.Choice(["a", "r"]), default="r")
+            choice = click.prompt(
+                "approve / reject? (a/r)", type=click.Choice(["a", "r"]), default="r"
+            )
         if choice == "r":
             core.reject_run_result(result, repo_root)
             console.print(f"[red]Rejected. Audit log: {result.audit_log_path}[/red]")
@@ -180,7 +185,9 @@ def run_cmd(  # noqa: PLR0913
 
 @main.command()
 @click.argument("run_id")
-@click.option("--repo-root", type=click.Path(exists=True, file_okay=False, path_type=Path), default=".")
+@click.option(
+    "--repo-root", type=click.Path(exists=True, file_okay=False, path_type=Path), default="."
+)
 def approve(run_id: str, repo_root: Path) -> None:
     """Apply a previously-completed run's diff."""
     repo_root = repo_root.resolve()
@@ -195,7 +202,9 @@ def approve(run_id: str, repo_root: Path) -> None:
 
 @main.command()
 @click.argument("run_id")
-@click.option("--repo-root", type=click.Path(exists=True, file_okay=False, path_type=Path), default=".")
+@click.option(
+    "--repo-root", type=click.Path(exists=True, file_okay=False, path_type=Path), default="."
+)
 def reject(run_id: str, repo_root: Path) -> None:
     """Discard a previously-completed run."""
     repo_root = repo_root.resolve()
@@ -210,8 +219,10 @@ def reject(run_id: str, repo_root: Path) -> None:
 @click.option("--accept-reviewer", "accept_reviewer", multiple=True, type=int)
 @click.option("--skip", "skip_items", multiple=True, type=int)
 @click.option("--note", default=None)
-@click.option("--repo-root", type=click.Path(exists=True, file_okay=False, path_type=Path), default=".")
-def arbitrate(  # noqa: PLR0913
+@click.option(
+    "--repo-root", type=click.Path(exists=True, file_okay=False, path_type=Path), default="."
+)
+def arbitrate(
     run_id: str,
     accept_writer: tuple[int, ...],
     accept_reviewer: tuple[int, ...],
@@ -279,7 +290,7 @@ def list_runs(repo_root: Path, limit: int) -> None:
         console.print("[dim]No runs found.[/dim]")
         return
 
-    epoch = datetime.min.replace(tzinfo=timezone.utc)
+    epoch = datetime.min.replace(tzinfo=UTC)
     results.sort(key=lambda r: r.started_at or epoch, reverse=True)
     results = results[:limit]
 
@@ -370,20 +381,24 @@ def _render_result(result: RunResult) -> None:
         console.print(
             f"\n[bold yellow]Acknowledged dissents ({len(result.acknowledged_dissents)}):[/bold yellow]"
         )
-        for d in result.acknowledged_dissents:
-            console.print(f"  · #{d.item.id}  {d.item.issue}")
-            console.print(f"    [dim]writer: {d.writer_response.rationale}[/dim]")
+        for dissent in result.acknowledged_dissents:
+            console.print(f"  · #{dissent.item.id}  {dissent.item.issue}")
+            console.print(f"    [dim]writer: {dissent.writer_response.rationale}[/dim]")
 
     if result.disputed_items:
         console.print(
             f"\n[bold red]Disputed items ({len(result.disputed_items)}) — need user arbitration:[/bold red]"
         )
-        for d in result.disputed_items:
-            loc = f"{d.item.file}:{d.item.lines}" if d.item.lines else (d.item.file or "")
-            console.print(f"  · #{d.item.id} [{d.item.severity.value}] {loc}")
-            console.print(f"    issue:   {d.item.issue}")
-            console.print(f"    writer:  {d.writer_response.rationale}")
-            console.print(f"    reviewer: {d.reviewer_rebuttal_item.rebuttal_reasoning}")
+        for dispute in result.disputed_items:
+            loc = (
+                f"{dispute.item.file}:{dispute.item.lines}"
+                if dispute.item.lines
+                else (dispute.item.file or "")
+            )
+            console.print(f"  · #{dispute.item.id} [{dispute.item.severity.value}] {loc}")
+            console.print(f"    issue:   {dispute.item.issue}")
+            console.print(f"    writer:  {dispute.writer_response.rationale}")
+            console.print(f"    reviewer: {dispute.reviewer_rebuttal_item.rebuttal_reasoning}")
 
     if result.error:
         console.print(f"\n[red]Error:[/red] {result.error}")

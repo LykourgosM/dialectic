@@ -3,21 +3,26 @@
 from __future__ import annotations
 
 import asyncio
-import time
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from dialectic import core, protocol as p
+from dialectic import core
+from dialectic import protocol as p
 from dialectic.agents.claude import ClaudeResult
 from dialectic.agents.codex import CodexResult
 
 
 def _writer_report_dict(**ov: Any) -> dict:
     base = {
-        "diff": "+ x", "summary": "x", "approaches": ["fix"], "confidence": "high",
-        "files_touched": [], "assumptions": [], "open_questions": [],
+        "diff": "+ x",
+        "summary": "x",
+        "approaches": ["fix"],
+        "confidence": "high",
+        "files_touched": [],
+        "assumptions": [],
+        "open_questions": [],
     }
     base.update(ov)
     return base
@@ -68,7 +73,7 @@ async def test_temp_schema_file_cleaned_after_codex_failure(
     """When the codex invoker raises mid-run, the temp schema file written by the
     default codex invoker should still be cleaned up by its finally block."""
     from dialectic import core as core_mod
-    from dialectic.protocol import AgentConfig, AgentCli, SandboxMode
+    from dialectic.protocol import AgentCli, AgentConfig, SandboxMode
 
     # The default codex invoker imports `invoke` from agents.codex as `_codex_invoke`;
     # patch the name as core sees it.
@@ -83,9 +88,12 @@ async def test_temp_schema_file_cleaned_after_codex_failure(
     cfg = AgentConfig(cli=AgentCli.CODEX, model="gpt-5.4", effort="xhigh")
     with pytest.raises(RuntimeError, match="simulated codex"):
         await core_mod._default_codex_invoker(
-            prompt="x", cfg=cfg, cwd=tmp_git_repo,
+            prompt="x",
+            cfg=cfg,
+            cwd=tmp_git_repo,
             output_schema={"type": "object", "properties": {}},
-            sandbox=SandboxMode.READ_ONLY, timeout_s=10,
+            sandbox=SandboxMode.READ_ONLY,
+            timeout_s=10,
         )
 
     # The temp file existed when codex was invoked, and the finally cleaned it up.

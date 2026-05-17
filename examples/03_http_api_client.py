@@ -17,7 +17,6 @@ import os
 
 import httpx
 
-
 BASE_URL = os.environ.get("DIALECTIC_URL", "http://127.0.0.1:8765")
 TOKEN = os.environ.get("DIALECTIC_TOKEN")
 
@@ -51,9 +50,7 @@ def main() -> int:
             return 0
 
         # Auto-approve (in a real script you'd render the diff for the user first).
-        approve = client.post(
-            f"{BASE_URL}/run/{result['run_id']}/approve", headers=auth_headers()
-        )
+        approve = client.post(f"{BASE_URL}/run/{result['run_id']}/approve", headers=auth_headers())
         approve.raise_for_status()
         print(f"\napplied: {approve.json()['status']}")
     return 0

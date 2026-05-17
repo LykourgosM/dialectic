@@ -9,15 +9,17 @@ import re
 import tempfile
 import uuid
 from collections import Counter
-from datetime import datetime, timezone
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, AsyncIterator, Awaitable, Callable
+from typing import Any, TypeVar
+
+from pydantic import BaseModel
 
 from . import worktree as wt
 from .agents.claude import ClaudeInvocation, ClaudeResult
 from .agents.claude import invoke as _claude_invoke
-from .agents.codex import CodexInvocation, CodexResult
-from .agents.codex import _make_strict_schema
+from .agents.codex import CodexInvocation, CodexResult, _make_strict_schema
 from .agents.codex import invoke as _codex_invoke
 from .protocol import (
     AcknowledgedDissent,
@@ -31,7 +33,6 @@ from .protocol import (
     DisputedItem,
     EventType,
     ItemRebuttalVerdict,
-    RebuttalVerdict,
     ReviewerCritique,
     ReviewerRebuttal,
     ReviewerVerdict,
@@ -48,6 +49,8 @@ from .protocol import (
 
 logger = logging.getLogger("dialectic")
 
+_M = TypeVar("_M", bound=BaseModel)
+
 # Invokers can be swapped for testing. Writer takes a permission_mode; reviewer takes a sandbox.
 WriterInvoke = Callable[
     [str, AgentConfig, Path, dict[str, Any], ClaudePermissionMode | None, int],
@@ -60,13 +63,13 @@ ReviewerInvoke = Callable[
 
 
 __all__ = [
-    "run",
     "apply_run_result",
-    "reject_run_result",
-    "resume_with_arbitration",
+    "load_project_context",
     "load_run_record",
     "persist_run_record",
-    "load_project_context",
+    "reject_run_result",
+    "resume_with_arbitration",
+    "run",
 ]
 
 
@@ -152,13 +155,15 @@ def _build_writer_initial_prompt(user_prompt: str, project_context: str) -> str:
     ]
     if project_context:
         parts.extend(["PROJECT CONTEXT:", project_context, ""])
-    parts.extend([
-        "INSTRUCTIONS:",
-        "1. Implement the task in the working directory (your current cwd). Edit files freely.",
-        "2. When done, output a single WriterReport JSON object describing what you did.",
-        "3. The 'diff' field should contain the unified diff of your changes.",
-        "4. Include any assumptions you made and any open questions.",
-    ])
+    parts.extend(
+        [
+            "INSTRUCTIONS:",
+            "1. Implement the task in the working directory (your current cwd). Edit files freely.",
+            "2. When done, output a single WriterReport JSON object describing what you did.",
+            "3. The 'diff' field should contain the unified diff of your changes.",
+            "4. Include any assumptions you made and any open questions.",
+        ]
+    )
     return "\n".join(parts)
 
 
@@ -176,31 +181,33 @@ def _build_reviewer_critique_prompt(
     ]
     if project_context:
         parts.extend(["PROJECT CONTEXT:", project_context, ""])
-    parts.extend([
-        "WRITER'S REPORT:",
-        writer_report.model_dump_json(indent=2),
-        "",
-        "AUTHORITATIVE DIFF (extracted from the writer's worktree):",
-        "```diff",
-        authoritative_diff or "(empty diff — writer made no changes)",
-        "```",
-        "",
-        "INSTRUCTIONS:",
-        "1. Your cwd is a clean copy of the codebase at the base ref. You have a "
-        "writable sandbox there — feel free to apply the diff (via `git apply` from "
-        "stdin), run tests, lint, type-check, or otherwise execute verification "
-        "commands. Your worktree is throwaway; any changes you make here are "
-        "discarded at the end of the run.",
-        "2. Review the diff against the original task and project conventions. "
-        "Whenever feasible, EXECUTE something — tests, a lint, a quick script — "
-        "rather than relying on inspection alone. State in your summary what you "
-        "actually executed.",
-        "3. Output a single ReviewerCritique JSON object.",
-        "4. Use unique integer ids for each CritiqueItem. The writer references items by id.",
-        "5. Set verdict=approve if the diff is ready as-is.",
-        "6. Set verdict=revise if changes are needed (provide CritiqueItems).",
-        "7. Set verdict=reject ONLY if the approach is fundamentally wrong and revision won't help.",
-    ])
+    parts.extend(
+        [
+            "WRITER'S REPORT:",
+            writer_report.model_dump_json(indent=2),
+            "",
+            "AUTHORITATIVE DIFF (extracted from the writer's worktree):",
+            "```diff",
+            authoritative_diff or "(empty diff — writer made no changes)",
+            "```",
+            "",
+            "INSTRUCTIONS:",
+            "1. Your cwd is a clean copy of the codebase at the base ref. You have a "
+            "writable sandbox there — feel free to apply the diff (via `git apply` from "
+            "stdin), run tests, lint, type-check, or otherwise execute verification "
+            "commands. Your worktree is throwaway; any changes you make here are "
+            "discarded at the end of the run.",
+            "2. Review the diff against the original task and project conventions. "
+            "Whenever feasible, EXECUTE something — tests, a lint, a quick script — "
+            "rather than relying on inspection alone. State in your summary what you "
+            "actually executed.",
+            "3. Output a single ReviewerCritique JSON object.",
+            "4. Use unique integer ids for each CritiqueItem. The writer references items by id.",
+            "5. Set verdict=approve if the diff is ready as-is.",
+            "6. Set verdict=revise if changes are needed (provide CritiqueItems).",
+            "7. Set verdict=reject ONLY if the approach is fundamentally wrong and revision won't help.",
+        ]
+    )
     return "\n".join(parts)
 
 
@@ -222,22 +229,24 @@ def _build_writer_revision_prompt(
     ]
     if project_context:
         parts.extend(["PROJECT CONTEXT:", project_context, ""])
-    parts.extend([
-        "YOUR PREVIOUS WORK (current state of your worktree):",
-        "```diff",
-        authoritative_diff,
-        "```",
-        "",
-        "REVIEWER'S CRITIQUE:",
-        critique.model_dump_json(indent=2),
-        "",
-        "INSTRUCTIONS:",
-        "1. For each critique item, decide: accept (change the code) or reject (defend with rationale).",
-        "2. If you accept, EDIT THE FILES in your worktree to address the issue, and set change_summary.",
-        "3. If you reject, DO NOT change the code for that item, and provide a clear rationale.",
-        "4. Your revised_diff field should reflect the cumulative state of your worktree after all accepts.",
-        "5. Output a single WriterResponseBundle JSON object with one response per critique item id.",
-    ])
+    parts.extend(
+        [
+            "YOUR PREVIOUS WORK (current state of your worktree):",
+            "```diff",
+            authoritative_diff,
+            "```",
+            "",
+            "REVIEWER'S CRITIQUE:",
+            critique.model_dump_json(indent=2),
+            "",
+            "INSTRUCTIONS:",
+            "1. For each critique item, decide: accept (change the code) or reject (defend with rationale).",
+            "2. If you accept, EDIT THE FILES in your worktree to address the issue, and set change_summary.",
+            "3. If you reject, DO NOT change the code for that item, and provide a clear rationale.",
+            "4. Your revised_diff field should reflect the cumulative state of your worktree after all accepts.",
+            "5. Output a single WriterResponseBundle JSON object with one response per critique item id.",
+        ]
+    )
     return "\n".join(parts)
 
 
@@ -261,27 +270,29 @@ def _build_reviewer_rebuttal_prompt(
     ]
     if project_context:
         parts.extend(["PROJECT CONTEXT:", project_context, ""])
-    parts.extend([
-        "YOUR PREVIOUS CRITIQUE:",
-        critique.model_dump_json(indent=2),
-        "",
-        "REVISED DIFF (after writer's accepts):",
-        "```diff",
-        revised_diff,
-        "```",
-        "",
-        "WRITER'S RESPONSES (focus on the rejected items below):",
-        response_bundle.model_dump_json(indent=2),
-        "",
-        f"REJECTED ITEMS TO EVALUATE: {[r.item_id for r in rejected]}",
-        "",
-        "INSTRUCTIONS:",
-        "1. For each item the writer REJECTED, evaluate their rationale.",
-        "2. accept_writer_rationale: rationale is reasonable; let it ship.",
-        "3. still_disputed: rationale is wrong or misses something; provide rebuttal_reasoning.",
-        "4. Use accept where reasonable — do not insist for the sake of insisting.",
-        "5. Output a single ReviewerRebuttal JSON object with item_rebuttals for each rejected item.",
-    ])
+    parts.extend(
+        [
+            "YOUR PREVIOUS CRITIQUE:",
+            critique.model_dump_json(indent=2),
+            "",
+            "REVISED DIFF (after writer's accepts):",
+            "```diff",
+            revised_diff,
+            "```",
+            "",
+            "WRITER'S RESPONSES (focus on the rejected items below):",
+            response_bundle.model_dump_json(indent=2),
+            "",
+            f"REJECTED ITEMS TO EVALUATE: {[r.item_id for r in rejected]}",
+            "",
+            "INSTRUCTIONS:",
+            "1. For each item the writer REJECTED, evaluate their rationale.",
+            "2. accept_writer_rationale: rationale is reasonable; let it ship.",
+            "3. still_disputed: rationale is wrong or misses something; provide rebuttal_reasoning.",
+            "4. Use accept where reasonable — do not insist for the sake of insisting.",
+            "5. Output a single ReviewerRebuttal JSON object with item_rebuttals for each rejected item.",
+        ]
+    )
     return "\n".join(parts)
 
 
@@ -291,10 +302,10 @@ def _build_reviewer_rebuttal_prompt(
 
 
 def _gen_run_id() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+    return datetime.now(UTC).strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
 
 
-def _coerce_structured(raw: Any, model_cls: type) -> Any:
+def _coerce_structured(raw: Any, model_cls: type[_M]) -> _M:
     """Try several shapes that the CLIs might return; raise ValueError if none parse."""
     from pydantic import ValidationError
 
@@ -440,9 +451,7 @@ def _validate_run_id(run_id: str) -> None:
     a user-supplied id like '../../etc/passwd' would escape `.dialectic/runs/`.
     """
     if not isinstance(run_id, str) or not _RUN_ID_RE.match(run_id):
-        raise ValueError(
-            f"Invalid run_id {run_id!r}: expected YYYYMMDD-HHMMSS-<hex>"
-        )
+        raise ValueError(f"Invalid run_id {run_id!r}: expected YYYYMMDD-HHMMSS-<hex>")
 
 
 def _runs_dir(repo_root: Path) -> Path:
@@ -481,7 +490,9 @@ def _append_prompt_log(
         "round": round_num,
         "role": role,
         "prompt": prompt,
-        "response": response if isinstance(response, (dict, list, str, int, float, type(None))) else str(response),
+        "response": response
+        if isinstance(response, (dict, list, str, int, float, type(None)))
+        else str(response),
         "cost_usd": cost_usd,
         "duration_s": duration_s,
     }
@@ -539,15 +550,22 @@ async def run(
     REVISION_STARTED/DONE, REBUTTAL_STARTED/DONE, DIFF_READY, RUN_FINISHED, ERROR).
     """
     run_id = _gen_run_id()
-    started_at = datetime.now(timezone.utc)
+    started_at = datetime.now(UTC)
 
-    def emit(event_type: EventType, message: str = "", payload: dict[str, Any] | None = None) -> None:
+    def emit(
+        event_type: EventType, message: str = "", payload: dict[str, Any] | None = None
+    ) -> None:
         if on_event is None:
             return
         try:
-            on_event(StreamEvent(
-                event_type=event_type, run_id=run_id, message=message, payload=payload or {},
-            ))
+            on_event(
+                StreamEvent(
+                    event_type=event_type,
+                    run_id=run_id,
+                    message=message,
+                    payload=payload or {},
+                )
+            )
         except Exception as exc:  # never let event handlers break the run
             logger.warning("on_event handler raised: %s", exc)
 
@@ -569,11 +587,15 @@ async def run(
     total_cost = 0.0
     rounds: list[RevisionRound] = []
 
-    emit(EventType.RUN_STARTED, f"Starting run {run_id}", {
-        "writer": f"{config.writer.cli.value}/{config.writer.model}/{config.writer.effort}",
-        "reviewer": f"{config.reviewer.cli.value}/{config.reviewer.model}/{config.reviewer.effort}",
-        "max_revisions": config.max_revisions,
-    })
+    emit(
+        EventType.RUN_STARTED,
+        f"Starting run {run_id}",
+        {
+            "writer": f"{config.writer.cli.value}/{config.writer.model}/{config.writer.effort}",
+            "reviewer": f"{config.reviewer.cli.value}/{config.reviewer.model}/{config.reviewer.effort}",
+            "max_revisions": config.max_revisions,
+        },
+    )
 
     try:
         with wt.worktree_pair(
@@ -587,7 +609,10 @@ async def run(
 
             # ─── INITIAL WRITER (runs once before the loop) ───
             writer_prompt = _build_writer_initial_prompt(config.prompt, project_context)
-            emit(EventType.WRITER_STARTED, f"Round 1: writer ({config.writer.cli.value}) initial draft")
+            emit(
+                EventType.WRITER_STARTED,
+                f"Round 1: writer ({config.writer.cli.value}) initial draft",
+            )
             writer_result = await _invoke_logged(
                 writer_inv,
                 cli=config.writer.cli,
@@ -686,7 +711,11 @@ async def run(
 
                 # ─── WRITER per-item response (the one writer call per revision round) ───
                 writer_response_prompt = _build_writer_revision_prompt(
-                    config.prompt, writer_report, critique, authoritative_diff, project_context,
+                    config.prompt,
+                    writer_report,
+                    critique,
+                    authoritative_diff,
+                    project_context,
                 )
                 emit(
                     EventType.REVISION_STARTED,
@@ -715,7 +744,9 @@ async def run(
                 )
                 _validate_response_covers_critique(response_bundle, critique)
                 round_obj.writer_responses = response_bundle
-                n_accept = sum(1 for r in response_bundle.responses if r.action == WriterAction.ACCEPT)
+                n_accept = sum(
+                    1 for r in response_bundle.responses if r.action == WriterAction.ACCEPT
+                )
                 n_reject = len(response_bundle.responses) - n_accept
                 emit(
                     EventType.REVISION_DONE,
@@ -742,8 +773,12 @@ async def run(
                         f"Round {round_num}: reviewer rebutting {len(rejected_responses)} defended item(s)",
                     )
                     rebuttal_prompt = _build_reviewer_rebuttal_prompt(
-                        config.prompt, writer_report, critique, response_bundle,
-                        revised_diff, project_context,
+                        config.prompt,
+                        writer_report,
+                        critique,
+                        response_bundle,
+                        revised_diff,
+                        project_context,
                     )
                     rebuttal_result = await _invoke_logged(
                         reviewer_inv,
@@ -767,7 +802,8 @@ async def run(
                     _validate_rebuttal_covers_rejections(rebuttal, response_bundle)
                     round_obj.reviewer_rebuttal = rebuttal
                     n_still = sum(
-                        1 for r in rebuttal.item_rebuttals
+                        1
+                        for r in rebuttal.item_rebuttals
                         if r.verdict == ItemRebuttalVerdict.STILL_DISPUTED
                     )
                     emit(
@@ -799,7 +835,7 @@ async def run(
     finally:
         result.rounds = rounds
         result.cost_usd = round(total_cost, 6)
-        result.finished_at = datetime.now(timezone.utc)
+        result.finished_at = datetime.now(UTC)
         if result.started_at is not None:
             result.duration_s = (result.finished_at - result.started_at).total_seconds()
 
@@ -864,18 +900,33 @@ async def _invoke_logged(
     """Wrap _invoke with logging + per-run prompts.jsonl audit append."""
     logger.info(
         "[%s] %s round=%d role=%s cli=%s model=%s effort=%s",
-        run_id, phase, round_num, role, cli.value, cfg.model, cfg.effort,
+        run_id,
+        phase,
+        round_num,
+        role,
+        cli.value,
+        cfg.model,
+        cfg.effort,
     )
     logger.debug("[%s] %s prompt (%d chars):\n%s", run_id, phase, len(prompt), prompt)
 
     result = await _invoke(
-        invoker, cli=cli, prompt=prompt, cfg=cfg, cwd=cwd,
-        output_schema=output_schema, extra=extra, timeout_s=timeout_s,
+        invoker,
+        cli=cli,
+        prompt=prompt,
+        cfg=cfg,
+        cwd=cwd,
+        output_schema=output_schema,
+        extra=extra,
+        timeout_s=timeout_s,
     )
 
     logger.info(
         "[%s] %s done cost=$%.4f duration=%.1fs%s",
-        run_id, phase, result.cost_usd or 0.0, result.duration_s or 0.0,
+        run_id,
+        phase,
+        result.cost_usd or 0.0,
+        result.duration_s or 0.0,
         f" ERROR={result.error}" if result.is_error else "",
     )
     logger.debug("[%s] %s response: %s", run_id, phase, result.structured)
@@ -922,7 +973,9 @@ def _validate_response_covers_critique(
         raise RuntimeError(f"Writer responded to unknown item id(s): {sorted(extra)}")
     dupes = [i for i, c in Counter(response_ids_list).items() if c > 1]
     if dupes:
-        raise RuntimeError(f"Writer responded to the same item id(s) multiple times: {sorted(dupes)}")
+        raise RuntimeError(
+            f"Writer responded to the same item id(s) multiple times: {sorted(dupes)}"
+        )
 
 
 def _validate_rebuttal_covers_rejections(
@@ -1012,7 +1065,9 @@ def apply_run_result(result: RunResult, repo_root: Path) -> RunResult:
         wt.apply_diff_to_working_tree(repo_root, result.diff)
     elif result.config.apply_mode == ApplyMode.BRANCH:
         branch_name = result.config.branch_name or f"dialectic/{result.run_id}"
-        commit_msg = f"dialectic run {result.run_id}\n\n{result.summary or result.config.prompt[:200]}"
+        commit_msg = (
+            f"dialectic run {result.run_id}\n\n{result.summary or result.config.prompt[:200]}"
+        )
         wt.apply_diff_to_new_branch(repo_root, result.diff, branch_name, base_sha, commit_msg)
     else:
         raise RuntimeError(f"Unknown apply_mode: {result.config.apply_mode}")
@@ -1041,10 +1096,9 @@ async def resume_with_arbitration(
 
     # Combine disputed_items (writer rejected + reviewer disputed) and unresolved_items
     # (max_revisions exhausted before writer could respond) — both need user arbitration.
-    needs_decision_ids = (
-        {d.item.id for d in result.disputed_items}
-        | {item.id for item in result.unresolved_items}
-    )
+    needs_decision_ids = {d.item.id for d in result.disputed_items} | {
+        item.id for item in result.unresolved_items
+    }
 
     decision_ids_list = [d.item_id for d in decisions]
     decision_ids = set(decision_ids_list)
@@ -1062,21 +1116,24 @@ async def resume_with_arbitration(
     # ACCEPT_REVIEWER requires applying suggested_fix as a patch on top of the writer's
     # diff, which needs a fix-format convention we haven't pinned down (suggested_fix is
     # free-text). Defer until v1.1.
-    for d in decisions:
-        if d.choice == ArbitrationChoice.ACCEPT_REVIEWER:
+    for decision in decisions:
+        if decision.choice == ArbitrationChoice.ACCEPT_REVIEWER:
             raise NotImplementedError(
                 "ACCEPT_REVIEWER not yet supported in v1 — pick ACCEPT_WRITER or SKIP, "
                 "then manually apply the reviewer's suggested_fix after `dialectic approve`."
             )
 
     result.arbitration = decisions
-    decision_by_id = {d.item_id: d for d in decisions}
+    decision_by_id = {decision.item_id: decision for decision in decisions}
 
     # Move disputed items to dissents (they ship with the writer's diff + arbitration log).
-    for d in result.disputed_items:
-        if decision_by_id[d.item.id].choice in (ArbitrationChoice.ACCEPT_WRITER, ArbitrationChoice.SKIP):
+    for disputed in result.disputed_items:
+        if decision_by_id[disputed.item.id].choice in (
+            ArbitrationChoice.ACCEPT_WRITER,
+            ArbitrationChoice.SKIP,
+        ):
             result.acknowledged_dissents.append(
-                AcknowledgedDissent(item=d.item, writer_response=d.writer_response)
+                AcknowledgedDissent(item=disputed.item, writer_response=disputed.writer_response)
             )
     result.disputed_items = []
 

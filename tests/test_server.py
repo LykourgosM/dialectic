@@ -95,9 +95,7 @@ def test_auth_required_when_token_set(tmp_git_repo: Path) -> None:
     response = client.get("/run/20260517-120000-abcdef")
     assert response.status_code == 401
 
-    response = client.get(
-        "/run/20260517-120000-abcdef", headers={"Authorization": "Bearer wrong"}
-    )
+    response = client.get("/run/20260517-120000-abcdef", headers={"Authorization": "Bearer wrong"})
     assert response.status_code == 401
 
     response = client.get(
@@ -115,5 +113,6 @@ def test_serve_refuses_non_loopback_without_token(monkeypatch: pytest.MonkeyPatc
 def test_serve_loopback_ok_without_token(monkeypatch: pytest.MonkeyPatch) -> None:
     """127.0.0.1 binds without a token (loopback is implicitly trusted)."""
     import uvicorn
+
     monkeypatch.setattr(uvicorn, "run", lambda *a, **kw: None)
     server.run(host="127.0.0.1", port=8765)

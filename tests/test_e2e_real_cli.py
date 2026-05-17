@@ -23,7 +23,8 @@ from pathlib import Path
 
 import pytest
 
-from dialectic import core, protocol as p
+from dialectic import core
+from dialectic import protocol as p
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("DIALECTIC_E2E"),
@@ -44,16 +45,16 @@ async def test_e2e_trivial_rename(tmp_git_repo: Path) -> None:
             "Make sure to keep the same signature and body, just rename."
         ),
         max_revisions=0,  # Just write+review, no iteration
-        writer=p.AgentConfig(
-            cli=p.AgentCli.CLAUDE, model="claude-sonnet-4-6", effort="medium"
-        ),
+        writer=p.AgentConfig(cli=p.AgentCli.CLAUDE, model="claude-sonnet-4-6", effort="medium"),
         reviewer=p.AgentConfig(cli=p.AgentCli.CODEX, model="gpt-5.4", effort="medium"),
         timeout_per_agent_s=300,
     )
 
     events: list[p.StreamEvent] = []
     result = await core.run(
-        config, tmp_git_repo, on_event=lambda ev: (events.append(ev), print(f"  {ev.message}"))[1] or None,
+        config,
+        tmp_git_repo,
+        on_event=lambda ev: (events.append(ev), print(f"  {ev.message}"))[1] or None,
     )
 
     # Status sanity

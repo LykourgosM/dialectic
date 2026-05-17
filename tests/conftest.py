@@ -36,9 +36,10 @@ def _no_real_cli_calls(monkeypatch: pytest.MonkeyPatch) -> None:
         return
     # Replace the binary lookup so any accidental call fails loudly.
     import asyncio
+
     original = asyncio.create_subprocess_exec
 
-    async def _block(*args, **kwargs):  # noqa: ANN002
+    async def _block(*args, **kwargs):
         if args and args[0] in ("claude", "codex"):
             raise RuntimeError(
                 f"Real CLI invocation blocked in tests: {args[0]}. "

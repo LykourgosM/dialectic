@@ -16,10 +16,10 @@ from typing import Any
 
 import pytest
 
-from dialectic import core, protocol as p
+from dialectic import core
+from dialectic import protocol as p
 from dialectic.agents.claude import ClaudeResult
 from dialectic.agents.codex import CodexResult
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers for building canned agent responses
@@ -129,9 +129,7 @@ async def test_writer_accepts_all_critique_items(tmp_git_repo: Path) -> None:
             (cwd / "main.py").write_text("def greet(name):\n    return f'hi {name}'\n")
             return claude_ok(writer_report_dict())
         else:
-            (cwd / "main.py").write_text(
-                "def greet(name: str) -> str:\n    return f'hi {name}'\n"
-            )
+            (cwd / "main.py").write_text("def greet(name: str) -> str:\n    return f'hi {name}'\n")
             return claude_ok(
                 writer_responses_dict(
                     [{"item_id": 1, "action": "accept", "change_summary": "added type hints"}]
@@ -202,11 +200,7 @@ async def test_writer_defends_reviewer_accepts_rationale_yields_dissent(
             return codex_ok(
                 critique_dict(
                     "revise",
-                    [
-                        critique_item_dict(
-                            1, "Use double quotes per PEP 8", categories=["style"]
-                        )
-                    ],
+                    [critique_item_dict(1, "Use double quotes per PEP 8", categories=["style"])],
                 )
             )
         else:
@@ -352,9 +346,7 @@ async def test_prompt_threading_critique_reaches_writer_revision(tmp_git_repo: P
             return codex_ok(
                 critique_dict(
                     "revise",
-                    [
-                        critique_item_dict(7, "Magic constant 0.42 needs a name", severity="medium")
-                    ],
+                    [critique_item_dict(7, "Magic constant 0.42 needs a name", severity="medium")],
                 )
             )
         return codex_ok(critique_dict("approve", []))
@@ -591,6 +583,7 @@ async def test_apply_uncommitted_modifies_working_tree(tmp_git_repo: Path) -> No
     assert "f'hi {name}'" in main_py
     # Should be uncommitted
     import subprocess
+
     status = subprocess.run(
         ["git", "status", "--porcelain"], cwd=tmp_git_repo, capture_output=True, text=True
     ).stdout
@@ -614,8 +607,12 @@ async def test_apply_branch_mode_creates_branch_and_commits(tmp_git_repo: Path) 
     assert applied.status == p.RunStatus.SUCCESS
 
     import subprocess
+
     branch = subprocess.run(
-        ["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=tmp_git_repo, capture_output=True, text=True
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=tmp_git_repo,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
     assert branch == "dialectic/test"
 
@@ -682,9 +679,7 @@ async def test_audit_log_captures_every_invocation(tmp_git_repo: Path) -> None:
         nonlocal reviewer_calls
         reviewer_calls += 1
         if reviewer_calls == 1:
-            return codex_ok(
-                critique_dict("revise", [critique_item_dict(1, "Use better naming")])
-            )
+            return codex_ok(critique_dict("revise", [critique_item_dict(1, "Use better naming")]))
         return codex_ok(
             rebuttal_dict(
                 "approve_with_dissent",
@@ -757,9 +752,7 @@ async def test_invariant_writer_missing_response_caught(tmp_git_repo: Path) -> N
             return claude_ok(writer_report_dict())
         # Critique had items 1 and 2; writer only responds to 1
         return claude_ok(
-            writer_responses_dict(
-                [{"item_id": 1, "action": "accept", "change_summary": "fixed"}]
-            )
+            writer_responses_dict([{"item_id": 1, "action": "accept", "change_summary": "fixed"}])
         )
 
     async def fake_reviewer(prompt, cfg, cwd, schema, sandbox, timeout):
@@ -811,7 +804,9 @@ async def test_stream_events_emitted_in_expected_order(tmp_git_repo: Path) -> No
     assert events[0].event_type == p.EventType.RUN_STARTED
     assert events[-1].event_type == p.EventType.RUN_FINISHED
     # Writer events come before reviewer events
-    assert event_types.index(p.EventType.WRITER_STARTED) < event_types.index(p.EventType.REVIEWER_STARTED)
+    assert event_types.index(p.EventType.WRITER_STARTED) < event_types.index(
+        p.EventType.REVIEWER_STARTED
+    )
 
 
 @pytest.mark.asyncio
@@ -835,7 +830,9 @@ async def test_stream_events_include_revision_and_rebuttal(tmp_git_repo: Path) -
         nonlocal reviewer_calls
         reviewer_calls += 1
         if reviewer_calls == 1:
-            return codex_ok(critique_dict("revise", [critique_item_dict(1, "x", severity="medium")]))
+            return codex_ok(
+                critique_dict("revise", [critique_item_dict(1, "x", severity="medium")])
+            )
         return codex_ok(
             rebuttal_dict(
                 "approve_with_dissent",

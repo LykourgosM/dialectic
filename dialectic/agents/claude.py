@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import time
 from pathlib import Path
+
 from pydantic import BaseModel, Field
 
 from ..protocol import AgentConfig, ClaudePermissionMode
@@ -85,17 +87,15 @@ async def invoke(invocation: ClaudeInvocation, timeout_s: int = 1500) -> ClaudeR
         )
         try:
             stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             # Graceful SIGTERM first, give it 5s, then SIGKILL.
             proc.terminate()
             try:
                 await asyncio.wait_for(proc.wait(), timeout=5)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 proc.kill()
-                try:
+                with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(proc.wait(), timeout=10)
-                except asyncio.TimeoutError:
-                    pass  # Best effort.
             return ClaudeResult(
                 raw_text="",
                 duration_s=time.monotonic() - start,
@@ -145,10 +145,7 @@ async def invoke(invocation: ClaudeInvocation, timeout_s: int = 1500) -> ClaudeR
     error_msg: str | None = None
     if errors_field:
         first = errors_field[0]
-        if isinstance(first, dict):
-            error_msg = first.get("message") or str(first)
-        else:
-            error_msg = str(first)
+        error_msg = first.get("message") or str(first) if isinstance(first, dict) else str(first)
 
     is_error_flag = bool(data.get("is_error", False)) or proc.returncode != 0
 
@@ -161,5 +158,3 @@ async def invoke(invocation: ClaudeInvocation, timeout_s: int = 1500) -> ClaudeR
         is_error=is_error_flag,
         error=error_msg or (stderr.strip() if is_error_flag and stderr.strip() else None),
     )
-
-

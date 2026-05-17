@@ -99,7 +99,10 @@ def test_apply_to_new_branch_creates_branch_and_commits(tmp_git_repo: Path) -> N
     wt.apply_diff_to_new_branch(tmp_git_repo, diff, "feature-x", base_sha, "test commit")
 
     current = subprocess.run(
-        ["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=tmp_git_repo, capture_output=True, text=True
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=tmp_git_repo,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
     assert current == "feature-x"
     log = subprocess.run(
@@ -147,8 +150,11 @@ def test_apply_to_new_branch_refuses_invalid_branch_name(tmp_git_repo: Path) -> 
     """Branch names must match [A-Za-z0-9._/-]+ — prevents --upload-pack-style injection."""
     with pytest.raises(wt.GitError, match="Invalid branch name"):
         wt.apply_diff_to_new_branch(
-            tmp_git_repo, "", "--upload-pack=evil",
-            wt.current_head_sha(tmp_git_repo), "x",
+            tmp_git_repo,
+            "",
+            "--upload-pack=evil",
+            wt.current_head_sha(tmp_git_repo),
+            "x",
         )
 
 
@@ -157,24 +163,27 @@ def test_keyboard_interrupt_triggers_keep_on_failure(tmp_git_repo: Path) -> None
     keep_on_failure is honored."""
     paths: list[Path] = []
     with pytest.raises(KeyboardInterrupt):
-        with wt.worktree_pair(tmp_git_repo, "20260517-001-aabbcc", "HEAD", keep_on_failure=True) as pair:
+        with wt.worktree_pair(
+            tmp_git_repo, "20260517-001-aabbcc", "HEAD", keep_on_failure=True
+        ) as pair:
             paths = [pair.writer_path, pair.reviewer_path]
             raise KeyboardInterrupt()
     assert all(p.exists() for p in paths), "Worktrees should be preserved on KeyboardInterrupt"
     # Manual cleanup so we don't pollute the test fixture.
     pair_for_cleanup = wt.WorktreePair(
-        run_id="20260517-001-aabbcc", repo_root=tmp_git_repo,
-        writer_path=paths[0], reviewer_path=paths[1],
-        base_ref="HEAD", base_sha=wt.current_head_sha(tmp_git_repo),
+        run_id="20260517-001-aabbcc",
+        repo_root=tmp_git_repo,
+        writer_path=paths[0],
+        reviewer_path=paths[1],
+        base_ref="HEAD",
+        base_sha=wt.current_head_sha(tmp_git_repo),
     )
     wt.cleanup(pair_for_cleanup)
 
 
 def test_working_tree_clean_handles_renames(tmp_git_repo: Path) -> None:
     """A rename outside .dialectic/ should mark the tree as dirty (not parse as one path)."""
-    subprocess.run(
-        ["git", "mv", "main.py", "renamed.py"], cwd=tmp_git_repo, check=True
-    )
+    subprocess.run(["git", "mv", "main.py", "renamed.py"], cwd=tmp_git_repo, check=True)
     assert not wt.working_tree_is_clean(tmp_git_repo)
 
 

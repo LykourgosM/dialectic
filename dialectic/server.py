@@ -40,9 +40,7 @@ def create_app(repo_root: Path, auth_token: str | None = None) -> FastAPI:
         token = request.app.state.auth_token
         if token is None:
             return
-        scheme, presented = get_authorization_scheme_param(
-            request.headers.get("Authorization")
-        )
+        scheme, presented = get_authorization_scheme_param(request.headers.get("Authorization"))
         if scheme.lower() != "bearer" or not presented:
             raise HTTPException(status_code=401, detail="Missing Bearer token")
         if not secrets.compare_digest(presented, token):
@@ -63,9 +61,7 @@ def create_app(repo_root: Path, auth_token: str | None = None) -> FastAPI:
         return await core.run(config, request.app.state.repo_root)
 
     @app.get("/run/{run_id}", response_model=RunResult)
-    async def get_run(
-        run_id: str, request: Request, _: None = Depends(require_token)
-    ) -> RunResult:
+    async def get_run(run_id: str, request: Request, _: None = Depends(require_token)) -> RunResult:
         return _load_or_raise(run_id, request.app.state.repo_root)
 
     @app.post("/run/{run_id}/approve", response_model=RunResult)

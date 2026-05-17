@@ -55,9 +55,7 @@ class TestReviewerRebuttalItem:
             p.ReviewerRebuttalItem(item_id=1, verdict=p.ItemRebuttalVerdict.STILL_DISPUTED)
 
     def test_accept_rationale_no_reasoning_ok(self) -> None:
-        r = p.ReviewerRebuttalItem(
-            item_id=1, verdict=p.ItemRebuttalVerdict.ACCEPT_WRITER_RATIONALE
-        )
+        r = p.ReviewerRebuttalItem(item_id=1, verdict=p.ItemRebuttalVerdict.ACCEPT_WRITER_RATIONALE)
         assert r.rebuttal_reasoning is None
 
 

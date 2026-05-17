@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -94,17 +95,15 @@ async def invoke(invocation: CodexInvocation, timeout_s: int = 1500) -> CodexRes
         )
         try:
             stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             # Graceful SIGTERM, fallback to SIGKILL.
             proc.terminate()
             try:
                 await asyncio.wait_for(proc.wait(), timeout=5)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 proc.kill()
-                try:
+                with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(proc.wait(), timeout=10)
-                except asyncio.TimeoutError:
-                    pass
             return CodexResult(
                 raw_text="",
                 duration_s=time.monotonic() - start,
@@ -231,7 +230,10 @@ def _compute_codex_cost(
             logger.warning(
                 "No pricing entry for codex model %r; cost reported as $0.00 "
                 "(tokens: in=%d cached=%d out=%d). Add to _CODEX_PRICING.",
-                model, input_tokens, cached_input_tokens, output_tokens,
+                model,
+                input_tokens,
+                cached_input_tokens,
+                output_tokens,
             )
         return 0.0
     uncached_input = max(0, input_tokens - cached_input_tokens)

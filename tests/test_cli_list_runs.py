@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -41,18 +41,14 @@ def _write_run(
 def wide_console(monkeypatch: pytest.MonkeyPatch) -> None:
     """Pin the CLI's rich console to a wide, non-terminal output so the table
     doesn't wrap based on the testing terminal's dimensions."""
-    monkeypatch.setattr(
-        cli_mod, "console", Console(width=200, force_terminal=False, no_color=True)
-    )
+    monkeypatch.setattr(cli_mod, "console", Console(width=200, force_terminal=False, no_color=True))
 
 
-def test_list_runs_renders_three_runs_sorted_desc(
-    tmp_path: Path, wide_console: None
-) -> None:
+def test_list_runs_renders_three_runs_sorted_desc(tmp_path: Path, wide_console: None) -> None:
     runs_dir = tmp_path / ".dialectic" / "runs"
     runs_dir.mkdir(parents=True)
 
-    base = datetime(2026, 5, 17, 12, 0, 0, tzinfo=timezone.utc)
+    base = datetime(2026, 5, 17, 12, 0, 0, tzinfo=UTC)
     _write_run(
         runs_dir,
         run_id="20260517-100000-aaaaaa",
@@ -151,14 +147,12 @@ def test_list_runs_missing_directory(tmp_path: Path, wide_console: None) -> None
     assert "No runs" in result.output
 
 
-def test_list_runs_limit_overrides_default(
-    tmp_path: Path, wide_console: None
-) -> None:
+def test_list_runs_limit_overrides_default(tmp_path: Path, wide_console: None) -> None:
     """--limit N caps the table at N rows, overriding the default of 10."""
     runs_dir = tmp_path / ".dialectic" / "runs"
     runs_dir.mkdir(parents=True)
 
-    base = datetime(2026, 5, 17, 12, 0, 0, tzinfo=timezone.utc)
+    base = datetime(2026, 5, 17, 12, 0, 0, tzinfo=UTC)
     # Create 15 runs (more than the default limit of 10) with strictly
     # increasing started_at; their short ids encode rank so we can assert
     # exactly which rows are kept.
@@ -176,9 +170,7 @@ def test_list_runs_limit_overrides_default(
     runner = CliRunner()
 
     # --limit 3: only the 3 newest runs (i=14, 13, 12) should appear.
-    result = runner.invoke(
-        main, ["list-runs", "--repo-root", str(tmp_path), "--limit", "3"]
-    )
+    result = runner.invoke(main, ["list-runs", "--repo-root", str(tmp_path), "--limit", "3"])
     assert result.exit_code == 0, result.output
     assert "zzzz14" in result.output
     assert "zzzz13" in result.output
@@ -187,9 +179,7 @@ def test_list_runs_limit_overrides_default(
         assert f"zzzz{older:02d}" not in result.output
 
     # --limit 15: all 15 runs should appear (above the default of 10).
-    result = runner.invoke(
-        main, ["list-runs", "--repo-root", str(tmp_path), "--limit", "15"]
-    )
+    result = runner.invoke(main, ["list-runs", "--repo-root", str(tmp_path), "--limit", "15"])
     assert result.exit_code == 0, result.output
     for i in range(15):
         assert f"zzzz{i:02d}" in result.output
@@ -198,20 +188,14 @@ def test_list_runs_limit_overrides_default(
 def test_list_runs_limit_rejects_zero(tmp_path: Path, wide_console: None) -> None:
     (tmp_path / ".dialectic" / "runs").mkdir(parents=True)
     runner = CliRunner()
-    result = runner.invoke(
-        main, ["list-runs", "--repo-root", str(tmp_path), "--limit", "0"]
-    )
+    result = runner.invoke(main, ["list-runs", "--repo-root", str(tmp_path), "--limit", "0"])
     assert result.exit_code != 0
     assert "limit" in result.output.lower()
 
 
-def test_list_runs_limit_rejects_negative(
-    tmp_path: Path, wide_console: None
-) -> None:
+def test_list_runs_limit_rejects_negative(tmp_path: Path, wide_console: None) -> None:
     (tmp_path / ".dialectic" / "runs").mkdir(parents=True)
     runner = CliRunner()
-    result = runner.invoke(
-        main, ["list-runs", "--repo-root", str(tmp_path), "--limit", "-5"]
-    )
+    result = runner.invoke(main, ["list-runs", "--repo-root", str(tmp_path), "--limit", "-5"])
     assert result.exit_code != 0
     assert "limit" in result.output.lower()

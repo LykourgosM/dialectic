@@ -12,13 +12,12 @@ extra keys that silently vanish.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Enums
@@ -465,7 +464,7 @@ class EventType(str, Enum):
 
 class StreamEvent(_Strict):
     event_type: EventType
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
     run_id: str
     message: str = ""
     payload: dict[str, Any] = Field(default_factory=dict)

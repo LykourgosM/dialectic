@@ -83,10 +83,19 @@ ignore = [
     "E501",     # line too long (formatter handles)
     "B008",     # function-call-in-default — fine for Field(default_factory=...)
     "SIM117",   # combine nested with — sometimes nested is clearer
+    "UP042",    # replace-str-enum — `class X(str, Enum)` is still idiomatic
+    "RUF002",   # ambiguous-unicode-character-docstring — em-dashes intentional
+    "RUF022",   # unsorted __all__ — we group by category for clarity
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["PT011"]  # broad pytest.raises is fine in tests
+"tests/**" = [
+    "PT011",   # broad pytest.raises is fine in tests
+    "PT012",   # multi-statement `with pytest.raises:` blocks — legitimate
+    "PT018",   # composite asserts — sometimes clearer
+    "E741",    # short loop vars are fine in tests
+    "F841",    # unused-assignment may be intentional for capture
+]
 "dialectic/protocol.py" = []
 "examples/**" = ["E402"]
 

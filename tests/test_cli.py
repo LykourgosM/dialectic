@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
-import json
 from pathlib import Path
 
 import pytest
@@ -12,17 +10,13 @@ from click.testing import CliRunner
 from dialectic import core
 from dialectic.cli import main
 from dialectic.protocol import (
-    AgentCli,
-    AgentConfig,
     ApplyMode,
-    CritiqueItem,
     ReviewerCritique,
     ReviewerVerdict,
     RevisionRound,
     RunConfig,
     RunResult,
     RunStatus,
-    Severity,
     WriterReport,
 )
 
@@ -81,13 +75,21 @@ def test_cli_run_dispatches_to_core(
     result = runner.invoke(
         main,
         [
-            "run", "--prompt", "test",
-            "--max-revisions", "2",
-            "--writer-model", "claude-opus-4-7",
-            "--writer-effort", "high",
-            "--reviewer-effort", "medium",
-            "--repo-root", str(tmp_git_repo),
-            "--auto-approve", "--dry-run",
+            "run",
+            "--prompt",
+            "test",
+            "--max-revisions",
+            "2",
+            "--writer-model",
+            "claude-opus-4-7",
+            "--writer-effort",
+            "high",
+            "--reviewer-effort",
+            "medium",
+            "--repo-root",
+            str(tmp_git_repo),
+            "--auto-approve",
+            "--dry-run",
         ],
     )
     assert result.exit_code == 0, result.output
@@ -106,13 +108,24 @@ def test_cli_run_dry_run_shortcut_overrides_apply_mode(
 
     async def fake_run(cfg, repo_root, **kwargs):
         captured["cfg"] = cfg
-        return RunResult(run_id="20260517-120000-abcdef", status=RunStatus.AWAITING_APPROVAL, config=cfg)
+        return RunResult(
+            run_id="20260517-120000-abcdef", status=RunStatus.AWAITING_APPROVAL, config=cfg
+        )
 
     monkeypatch.setattr(core, "run", fake_run)
     runner.invoke(
         main,
-        ["run", "--prompt", "x", "--apply-mode", "uncommitted", "--dry-run",
-         "--repo-root", str(tmp_git_repo), "--auto-approve"],
+        [
+            "run",
+            "--prompt",
+            "x",
+            "--apply-mode",
+            "uncommitted",
+            "--dry-run",
+            "--repo-root",
+            str(tmp_git_repo),
+            "--auto-approve",
+        ],
     )
     assert captured["cfg"].apply_mode == ApplyMode.DRY_RUN
 
@@ -138,9 +151,7 @@ def test_cli_approve_loads_record_and_applies(
     assert applied == [result_obj.run_id]
 
 
-def test_cli_reject_loads_record_and_rejects(
-    runner: CliRunner, tmp_git_repo: Path
-) -> None:
+def test_cli_reject_loads_record_and_rejects(runner: CliRunner, tmp_git_repo: Path) -> None:
     result_obj = _make_completed_result(tmp_git_repo)
     cli_result = runner.invoke(
         main,
@@ -151,9 +162,7 @@ def test_cli_reject_loads_record_and_rejects(
     assert reloaded.status == RunStatus.REJECTED_BY_USER
 
 
-def test_cli_approve_invalid_run_id_format_errors(
-    runner: CliRunner, tmp_git_repo: Path
-) -> None:
+def test_cli_approve_invalid_run_id_format_errors(runner: CliRunner, tmp_git_repo: Path) -> None:
     """Path-traversal regression: bogus run_ids must be rejected before disk access."""
     cli_result = runner.invoke(
         main,
@@ -178,10 +187,16 @@ def test_cli_arbitrate_builds_decisions(
     cli_result = runner.invoke(
         main,
         [
-            "arbitrate", "20260517-120000-abcdef",
-            "--accept-writer", "1", "--accept-writer", "3",
-            "--skip", "2",
-            "--repo-root", str(tmp_git_repo),
+            "arbitrate",
+            "20260517-120000-abcdef",
+            "--accept-writer",
+            "1",
+            "--accept-writer",
+            "3",
+            "--skip",
+            "2",
+            "--repo-root",
+            str(tmp_git_repo),
         ],
     )
     assert cli_result.exit_code == 0, cli_result.output
@@ -249,6 +264,7 @@ def test_cli_serve_refuses_non_localhost_without_token(
 
     # uvicorn.run would otherwise block; patch it to no-op so test completes if we got that far.
     import uvicorn
+
     monkeypatch.setattr(uvicorn, "run", lambda *a, **kw: None)
 
     cli_result = runner.invoke(main, ["serve", "--host", "0.0.0.0"])

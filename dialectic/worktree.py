@@ -14,9 +14,9 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
 
 from pydantic import BaseModel
 
@@ -44,9 +44,7 @@ def _git(repo_root: Path, *args: str, check: bool = True, input_text: str | None
         input=input_text,
     )
     if check and result.returncode != 0:
-        raise GitError(
-            f"git {' '.join(args)} failed (cwd={repo_root}):\n{result.stderr.strip()}"
-        )
+        raise GitError(f"git {' '.join(args)} failed (cwd={repo_root}):\n{result.stderr.strip()}")
     return result.stdout
 
 
@@ -104,8 +102,12 @@ def _is_dialectic_path(path: str) -> bool:
 
 
 _GIT_OPERATION_FILES = (
-    "rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD",
-    "BISECT_LOG", "REVERT_HEAD",
+    "rebase-merge",
+    "rebase-apply",
+    "MERGE_HEAD",
+    "CHERRY_PICK_HEAD",
+    "BISECT_LOG",
+    "REVERT_HEAD",
 )
 
 
@@ -206,7 +208,7 @@ def _validate_diff_paths(diff: str) -> None:
     """
     suspect: list[str] = []
     for line in diff.splitlines():
-        if not (line.startswith("+++ b/") or line.startswith("--- a/")):
+        if not line.startswith(("+++ b/", "--- a/")):
             continue
         path = line[6:].strip()
         if path == "/dev/null":
@@ -301,8 +303,12 @@ def apply_diff_to_new_branch(
             # user can run their hooks manually if they want).
             _git(
                 repo_root,
-                "-c", "commit.gpgsign=false",
-                "commit", "--no-verify", "-m", commit_message,
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--no-verify",
+                "-m",
+                commit_message,
             )
     except GitError:
         # Roll back: return to the original branch and delete the half-built one.
