@@ -149,3 +149,69 @@ def test_list_runs_missing_directory(tmp_path: Path, wide_console: None) -> None
 
     assert result.exit_code == 0, result.output
     assert "No runs" in result.output
+
+
+def test_list_runs_limit_overrides_default(
+    tmp_path: Path, wide_console: None
+) -> None:
+    """--limit N caps the table at N rows, overriding the default of 10."""
+    runs_dir = tmp_path / ".dialectic" / "runs"
+    runs_dir.mkdir(parents=True)
+
+    base = datetime(2026, 5, 17, 12, 0, 0, tzinfo=timezone.utc)
+    # Create 15 runs (more than the default limit of 10) with strictly
+    # increasing started_at; their short ids encode rank so we can assert
+    # exactly which rows are kept.
+    for i in range(15):
+        _write_run(
+            runs_dir,
+            run_id=f"20260517-{i:06d}-zzzz{i:02d}",
+            prompt=f"task {i}",
+            status=RunStatus.SUCCESS,
+            cost_usd=0.0001 * (i + 1),
+            duration_s=float(i + 1),
+            started_at=base + timedelta(minutes=i),
+        )
+
+    runner = CliRunner()
+
+    # --limit 3: only the 3 newest runs (i=14, 13, 12) should appear.
+    result = runner.invoke(
+        main, ["list-runs", "--repo-root", str(tmp_path), "--limit", "3"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "zzzz14" in result.output
+    assert "zzzz13" in result.output
+    assert "zzzz12" in result.output
+    for older in range(12):
+        assert f"zzzz{older:02d}" not in result.output
+
+    # --limit 15: all 15 runs should appear (above the default of 10).
+    result = runner.invoke(
+        main, ["list-runs", "--repo-root", str(tmp_path), "--limit", "15"]
+    )
+    assert result.exit_code == 0, result.output
+    for i in range(15):
+        assert f"zzzz{i:02d}" in result.output
+
+
+def test_list_runs_limit_rejects_zero(tmp_path: Path, wide_console: None) -> None:
+    (tmp_path / ".dialectic" / "runs").mkdir(parents=True)
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["list-runs", "--repo-root", str(tmp_path), "--limit", "0"]
+    )
+    assert result.exit_code != 0
+    assert "limit" in result.output.lower()
+
+
+def test_list_runs_limit_rejects_negative(
+    tmp_path: Path, wide_console: None
+) -> None:
+    (tmp_path / ".dialectic" / "runs").mkdir(parents=True)
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["list-runs", "--repo-root", str(tmp_path), "--limit", "-5"]
+    )
+    assert result.exit_code != 0
+    assert "limit" in result.output.lower()

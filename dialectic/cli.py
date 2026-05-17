@@ -254,8 +254,14 @@ def arbitrate(  # noqa: PLR0913
     type=click.Path(exists=True, file_okay=False, path_type=Path),
     default=".",
 )
-def list_runs(repo_root: Path) -> None:
-    """Print the 10 most recent runs as a table."""
+@click.option(
+    "--limit",
+    type=click.IntRange(min=1),
+    default=10,
+    help="Maximum number of runs to display (positive integer).",
+)
+def list_runs(repo_root: Path, limit: int) -> None:
+    """Print the N most recent runs as a table (default 10)."""
     repo_root = repo_root.resolve()
     runs_dir = repo_root / ".dialectic" / "runs"
     if not runs_dir.is_dir():
@@ -275,7 +281,7 @@ def list_runs(repo_root: Path) -> None:
 
     epoch = datetime.min.replace(tzinfo=timezone.utc)
     results.sort(key=lambda r: r.started_at or epoch, reverse=True)
-    results = results[:10]
+    results = results[:limit]
 
     status_color = {
         RunStatus.SUCCESS: "green",
