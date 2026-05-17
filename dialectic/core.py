@@ -22,6 +22,7 @@ from .agents.claude import invoke as _claude_invoke
 from .agents.codex import CodexInvocation, CodexResult, _make_strict_schema
 from .agents.codex import invoke as _codex_invoke
 from .protocol import (
+    CURRENT_PROTOCOL_VERSION,
     AcknowledgedDissent,
     AgentCli,
     AgentConfig,
@@ -193,6 +194,25 @@ def _build_reviewer_critique_prompt(
             authoritative_diff or "(empty diff — writer made no changes)",
             "```",
             "",
+        ]
+    )
+    # v0.2: surface the writer's open_questions explicitly as items the reviewer
+    # MUST address. Without this nudge, reviewers in past runs ignored every one
+    # of the writer's open_questions (Evaluator A finding).
+    if writer_report.open_questions:
+        parts.extend(
+            [
+                "WRITER'S OPEN QUESTIONS (you MUST respond to each one in your critique):",
+                *(f"  - {q}" for q in writer_report.open_questions),
+                "",
+                "For each open question above, either (a) raise it as a CritiqueItem with a "
+                "concrete recommendation, or (b) explicitly endorse the writer's current choice "
+                "in your summary by referring to the question. Do NOT silently ignore them.",
+                "",
+            ]
+        )
+    parts.extend(
+        [
             "INSTRUCTIONS:",
             "1. Your cwd is a clean copy of the codebase at the base ref. You have a "
             "writable sandbox there — feel free to apply the diff (via `git apply` from "
@@ -492,7 +512,37 @@ def load_run_record(run_id: str, repo_root: Path) -> RunResult:
         raise ValueError(f"run_id {run_id!r} resolves outside runs dir")
     if not path.exists():
         raise FileNotFoundError(f"No run record for {run_id!r} at {path}")
-    return RunResult.model_validate_json(path.read_text())
+    record = RunResult.model_validate_json(path.read_text())
+
+    # Schema version compatibility check.
+    record_ver = _parse_semver(record.protocol_version)
+    current_ver = _parse_semver(CURRENT_PROTOCOL_VERSION)
+    if record_ver > current_ver:
+        raise ValueError(
+            f"Run {run_id} was written with protocol_version={record.protocol_version}, "
+            f"newer than this dialectic's {CURRENT_PROTOCOL_VERSION}. "
+            "Upgrade dialectic to load this record."
+        )
+    if record_ver < current_ver:
+        logger.warning(
+            "Run %s was written with protocol_version=%s; loading under %s. "
+            "Some fields may be defaulted; apply-time safety checks (e.g. base_sha) "
+            "may be unavailable.",
+            run_id,
+            record.protocol_version,
+            CURRENT_PROTOCOL_VERSION,
+        )
+
+    return record
+
+
+def _parse_semver(v: str) -> tuple[int, int, int]:
+    """Tolerant semver parse. Treats `X`/`X.Y`/`X.Y.Z` uniformly; ignores any suffix."""
+    parts = v.split(".")[:3]
+    nums = [int(p.split("-")[0]) for p in parts]
+    while len(nums) < 3:
+        nums.append(0)
+    return (nums[0], nums[1], nums[2])
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -560,6 +610,7 @@ async def run(
     rebuttal_schema = ReviewerRebuttal.model_json_schema()
 
     result = RunResult(
+        protocol_version=CURRENT_PROTOCOL_VERSION,
         run_id=run_id,
         status=RunStatus.AWAITING_APPROVAL,
         config=config,
@@ -1023,12 +1074,20 @@ def apply_run_result(result: RunResult, repo_root: Path) -> RunResult:
         )
 
     # Use the SHA captured at run-start, not a fresh resolution of base_ref.
-    # If we re-resolved "HEAD" here it'd be tautologically equal to current_head
+    # Re-resolving "HEAD" here would be tautologically equal to current_head
     # even after the user has switched branches or committed something else.
+    # An empty base_sha means the record predates base_sha capture (Phase 2),
+    # so we can no longer verify HEAD-stability: refuse rather than silently
+    # falling back to re-resolution, which defeats the whole safety check.
     base_sha = result.base_sha
     if not base_sha:
-        # Backwards-compat with run records persisted before base_sha was tracked.
-        base_sha = wt.resolve_base_sha(repo_root, result.config.base_ref)
+        raise RuntimeError(
+            f"Run {result.run_id} has no captured base_sha (record predates the field). "
+            "Cannot verify HEAD-stability at apply time. Re-run with the current dialectic "
+            "version to capture base_sha, or extract the diff manually with "
+            f"`jq -r .diff .dialectic/runs/{result.run_id}.json | git apply` if you accept "
+            "that you may be applying against a different base than the run was built from."
+        )
 
     current_head = wt.current_head_sha(repo_root)
     if current_head != base_sha:

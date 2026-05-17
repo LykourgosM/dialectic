@@ -386,9 +386,21 @@ class RunConfig(_Strict):
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+#: Bumped whenever a non-additive change is made to the persisted RunResult shape.
+#: load_run_record uses this to detect records produced by an older/newer schema.
+CURRENT_PROTOCOL_VERSION = "0.2.0"
+
+
 class RunResult(_Strict):
     """End-of-run structured output. Persisted to .dialectic/runs/<id>.json."""
 
+    protocol_version: str = Field(
+        default="0.1.0",
+        description=(
+            "Schema version of this record. load_run_record warns when loading a record "
+            "from an older version and fails loudly when loading a newer one."
+        ),
+    )
     run_id: str
     status: RunStatus
     config: RunConfig

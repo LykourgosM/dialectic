@@ -115,3 +115,29 @@ def test_task_label_correct_for_role(name: str) -> None:
     else:
         assert "ORIGINAL TASK:" in prompt
         assert "TASK FROM USER:" not in prompt
+
+
+def test_reviewer_critique_surfaces_writer_open_questions() -> None:
+    """v0.2: writer's open_questions are surfaced explicitly in the reviewer prompt
+    so the reviewer is structurally nudged to address each one (Evaluator A finding:
+    in past runs the reviewer ignored every open_question)."""
+    report = WriterReport(
+        diff=DIFF,
+        summary="x",
+        open_questions=[
+            "should we cap the column at display width or character count?",
+            "is `-n` a desirable short alias for `--limit`?",
+        ],
+    )
+    prompt = _build_reviewer_critique_prompt(USER_PROMPT, report, DIFF, PROJECT_CONTEXT)
+    assert "OPEN QUESTIONS" in prompt
+    assert "should we cap the column" in prompt
+    assert "`-n` a desirable short alias" in prompt
+    assert "you MUST respond" in prompt or "must respond" in prompt.lower()
+
+
+def test_reviewer_critique_omits_open_questions_block_when_empty() -> None:
+    """If the writer has no open_questions, don't add an empty header to the prompt."""
+    report = WriterReport(diff=DIFF, summary="x", open_questions=[])
+    prompt = _build_reviewer_critique_prompt(USER_PROMPT, report, DIFF, PROJECT_CONTEXT)
+    assert "OPEN QUESTIONS" not in prompt

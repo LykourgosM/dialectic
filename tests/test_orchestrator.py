@@ -1060,6 +1060,87 @@ async def test_load_run_record_rejects_path_traversal(tmp_git_repo: Path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_load_run_record_warns_on_older_protocol_version(
+    tmp_git_repo: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """v0.2: loading a record from an older protocol_version logs a WARNING (not fatal)."""
+    import logging
+
+    async def fake_writer(prompt, cfg, cwd, schema, perm, timeout):
+        (cwd / "main.py").write_text("changed\n")
+        return claude_ok(writer_report_dict())
+
+    async def fake_reviewer(prompt, cfg, cwd, schema, sandbox, timeout):
+        return codex_ok(critique_dict("approve", []))
+
+    result = await core.run(
+        p.RunConfig(prompt="x"),
+        tmp_git_repo,
+        writer_invoke=fake_writer,
+        reviewer_invoke=fake_reviewer,
+    )
+    # Force an older version into the persisted record.
+    result.protocol_version = "0.0.1"
+    core.persist_run_record(result, tmp_git_repo)
+
+    with caplog.at_level(logging.WARNING, logger="dialectic"):
+        loaded = core.load_run_record(result.run_id, tmp_git_repo)
+    assert loaded.run_id == result.run_id
+    assert "protocol_version=0.0.1" in caplog.text
+    assert "loading under" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_load_run_record_refuses_newer_protocol_version(tmp_git_repo: Path) -> None:
+    """v0.2: loading a record from a newer protocol_version raises (fail loudly)."""
+
+    async def fake_writer(prompt, cfg, cwd, schema, perm, timeout):
+        (cwd / "main.py").write_text("changed\n")
+        return claude_ok(writer_report_dict())
+
+    async def fake_reviewer(prompt, cfg, cwd, schema, sandbox, timeout):
+        return codex_ok(critique_dict("approve", []))
+
+    result = await core.run(
+        p.RunConfig(prompt="x"),
+        tmp_git_repo,
+        writer_invoke=fake_writer,
+        reviewer_invoke=fake_reviewer,
+    )
+    # Forge a record from a future schema version.
+    result.protocol_version = "99.0.0"
+    core.persist_run_record(result, tmp_git_repo)
+
+    with pytest.raises(ValueError, match="newer than this dialectic"):
+        core.load_run_record(result.run_id, tmp_git_repo)
+
+
+@pytest.mark.asyncio
+async def test_apply_refuses_on_empty_base_sha(tmp_git_repo: Path) -> None:
+    """v0.2 fix: refuse to apply records that predate base_sha capture, instead
+    of silently re-resolving config.base_ref (which is tautological when
+    base_ref='HEAD' and defeats the whole point of the safety check)."""
+
+    async def fake_writer(prompt, cfg, cwd, schema, perm, timeout):
+        (cwd / "main.py").write_text("def greet(name):\n    return f'hi {name}'\n")
+        return claude_ok(writer_report_dict())
+
+    async def fake_reviewer(prompt, cfg, cwd, schema, sandbox, timeout):
+        return codex_ok(critique_dict("approve", []))
+
+    result = await core.run(
+        p.RunConfig(prompt="x"),
+        tmp_git_repo,
+        writer_invoke=fake_writer,
+        reviewer_invoke=fake_reviewer,
+    )
+    # Simulate an old record by clearing the captured base_sha.
+    result.base_sha = ""
+    with pytest.raises(RuntimeError, match="no captured base_sha"):
+        core.apply_run_result(result, tmp_git_repo)
+
+
+@pytest.mark.asyncio
 async def test_diff_exceeds_max_lines_aborts(tmp_git_repo: Path) -> None:
     async def fake_writer(prompt, cfg, cwd, schema, perm, timeout):
         # Write a huge file

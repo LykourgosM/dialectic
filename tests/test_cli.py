@@ -60,6 +60,12 @@ def test_cli_run_dispatches_to_core(
     """The `run` command builds a RunConfig from flags and calls core.run."""
     captured: dict = {}
 
+    import subprocess
+
+    base_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=tmp_git_repo, capture_output=True, text=True
+    ).stdout.strip()
+
     async def fake_run(cfg, repo_root, **kwargs):
         captured["cfg"] = cfg
         captured["repo_root"] = repo_root
@@ -67,6 +73,7 @@ def test_cli_run_dispatches_to_core(
             run_id="20260517-120000-abcdef",
             status=RunStatus.AWAITING_APPROVAL,
             config=cfg,
+            base_sha=base_sha,
             diff="",
         )
 
