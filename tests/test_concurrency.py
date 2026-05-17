@@ -67,9 +67,6 @@ async def test_temp_schema_file_cleaned_after_codex_failure(
 ) -> None:
     """When the codex invoker raises mid-run, the temp schema file written by the
     default codex invoker should still be cleaned up by its finally block."""
-    import tempfile
-    import glob
-
     from dialectic import core as core_mod
     from dialectic.protocol import AgentConfig, AgentCli, SandboxMode
 
@@ -92,9 +89,10 @@ async def test_temp_schema_file_cleaned_after_codex_failure(
         )
 
     # The temp file existed when codex was invoked, and the finally cleaned it up.
+    # We assert specifically on the file THIS test created, not a global tempdir
+    # glob — concurrent dialectic runs (or a parallel test run) would have their
+    # own dialectic-schema-* files briefly in tempdir, which would make a global
+    # assertion racy. This was caught when an outer dialectic-on-dialectic run's
+    # reviewer ran pytest while the orchestrator's own schema temp file was open.
     assert seen_schema_paths and seen_schema_paths[0] is not None
     assert not seen_schema_paths[0].exists(), "temp schema file not cleaned up after failure"
-
-    # And no orphan temp files left behind in tempdir.
-    leftover = glob.glob(str(Path(tempfile.gettempdir()) / "dialectic-schema-*.json"))
-    assert leftover == [], f"Temp schema files leaked: {leftover}"
