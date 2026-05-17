@@ -1,19 +1,23 @@
 """Pydantic models defining the contract between orchestrator and subagents.
 
-Every subagent invocation (writer, reviewer, revision, rebuttal) sends and receives
-one of these. They are passed to the CLIs as `--json-schema` / `--output-schema` so
-the LLMs are forced to produce structured output the orchestrator can parse without
-prose-fishing.
+Every subagent invocation (writer initial, reviewer critique, writer revision,
+reviewer rebuttal) sends and receives one of these. They are passed to the CLIs
+as `--json-schema` (Claude) / `--output-schema` (Codex) so the LLMs are forced
+to produce structured output the orchestrator can parse without prose-fishing.
+
+All models inherit from `_Strict`, which sets `extra="forbid"` — the JSON Schema
+emitted will include `additionalProperties: false` so LLMs can't hallucinate
+extra keys that silently vanish.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Literal
+from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -42,7 +46,7 @@ class Category(str, Enum):
 class ReviewerVerdict(str, Enum):
     APPROVE = "approve"
     REVISE = "revise"
-    REJECT = "reject"
+    REJECT = "reject"  # Diff so bad it shouldn't even be revised; abort.
 
 
 class WriterAction(str, Enum):
@@ -50,15 +54,72 @@ class WriterAction(str, Enum):
     REJECT = "reject"
 
 
+class ItemRebuttalVerdict(str, Enum):
+    """Per-item verdict during the reviewer's rebuttal pass."""
+
+    ACCEPT_WRITER_RATIONALE = "accept_writer_rationale"
+    STILL_DISPUTED = "still_disputed"
+
+
 class RebuttalVerdict(str, Enum):
+    """Reviewer's overall verdict in the rebuttal pass."""
+
     APPROVE = "approve"
     APPROVE_WITH_DISSENT = "approve_with_dissent"
     STILL_DISPUTED = "still_disputed"
 
 
+class WriterApproach(str, Enum):
+    FIX = "fix"
+    ADD = "add"
+    REFACTOR = "refactor"
+    OPTIMIZE = "optimize"
+    REMOVE = "remove"
+    OTHER = "other"
+
+
+class WriterConfidence(str, Enum):
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+
 class AgentCli(str, Enum):
     CLAUDE = "claude"
     CODEX = "codex"
+
+
+class ClaudeEffort(str, Enum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    XHIGH = "xhigh"
+    MAX = "max"
+
+
+class CodexEffort(str, Enum):
+    """Codex 0.121 accepts minimal/low/medium/high/xhigh. 'max' is NOT valid."""
+
+    MINIMAL = "minimal"
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    XHIGH = "xhigh"
+
+
+class SandboxMode(str, Enum):
+    READ_ONLY = "read-only"
+    WORKSPACE_WRITE = "workspace-write"
+    DANGER_FULL_ACCESS = "danger-full-access"
+
+
+class ClaudePermissionMode(str, Enum):
+    ACCEPT_EDITS = "acceptEdits"
+    AUTO = "auto"
+    BYPASS = "bypassPermissions"
+    DEFAULT = "default"
+    DONT_ASK = "dontAsk"
+    PLAN = "plan"
 
 
 class ApplyMode(str, Enum):
@@ -69,6 +130,7 @@ class ApplyMode(str, Enum):
 
 class RunStatus(str, Enum):
     SUCCESS = "success"
+    APPLIED_WITH_DISSENT = "applied_with_dissent"
     REJECTED_BY_USER = "rejected_by_user"
     FAILED = "failed"
     TIMED_OUT = "timed_out"
@@ -76,12 +138,55 @@ class RunStatus(str, Enum):
     AWAITING_ARBITRATION = "awaiting_arbitration"
 
 
+class ArbitrationChoice(str, Enum):
+    ACCEPT_WRITER = "accept_writer"  # Keep writer's code as-is (writer wins the dispute).
+    ACCEPT_REVIEWER = "accept_reviewer"  # Apply the reviewer's suggested_fix.
+    SKIP = "skip"  # Ship the diff but flag the item as known-unresolved in audit log.
+
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Reviewer → orchestrator
+# Base model — strict by default
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-class CritiqueItem(BaseModel):
+class _Strict(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Writer initial output
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class WriterReport(_Strict):
+    """The writer's initial output: diff plus structured metadata.
+
+    Wrapping the diff lets the reviewer see what the writer was *trying* to do,
+    and gives the v1.5 auto-journal something to record beyond the raw patch.
+    """
+
+    diff: str = Field(description="Unified diff against base_ref.")
+    summary: str = Field(description="One-paragraph description of what was changed and why.")
+    approaches: list[WriterApproach] = Field(
+        default_factory=lambda: [WriterApproach.OTHER],
+        description="One or more approaches (a change can be both e.g. refactor and fix).",
+    )
+    confidence: WriterConfidence = WriterConfidence.MEDIUM
+    files_touched: list[str] = Field(default_factory=list)
+    assumptions: list[str] = Field(
+        default_factory=list, description="Things the writer assumed about intent."
+    )
+    open_questions: list[str] = Field(
+        default_factory=list, description="Things the writer is unsure about."
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Reviewer critique
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class CritiqueItem(_Strict):
     id: int = Field(description="Stable id within this critique; writer references by id.")
     severity: Severity
     categories: list[Category] = Field(
@@ -90,118 +195,200 @@ class CritiqueItem(BaseModel):
     )
     file: str | None = Field(default=None, description="Path relative to repo root.")
     lines: str | None = Field(
-        default=None,
-        description="Line range (e.g., '42-48') or pattern. None for non-line-specific issues.",
+        default=None, description="Line range (e.g., '42-48'). None for non-line-specific issues."
     )
-    issue: str = Field(description="What's wrong.")
-    suggested_fix: str | None = Field(default=None, description="Optional concrete fix.")
+    issue: str
+    suggested_fix: str | None = None
+
+    @model_validator(mode="after")
+    def _lines_requires_file(self) -> CritiqueItem:
+        if self.lines is not None and self.file is None:
+            raise ValueError("lines requires file to be set")
+        return self
 
 
-class ReviewerCritique(BaseModel):
-    """Reviewer's structured output after seeing the writer's diff."""
+class ReviewerCritique(_Strict):
+    """Reviewer's output after seeing the writer's diff."""
 
+    reviewer_id: str | None = Field(
+        default=None,
+        description="Identifier for the reviewer (for v1.1 multi-reviewer panels). None in v1.",
+    )
     verdict: ReviewerVerdict
     items: list[CritiqueItem] = Field(default_factory=list)
-    summary: str = Field(description="One-paragraph overall assessment.")
+    summary: str
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Writer → orchestrator (revision pass)
+# Writer response to critique
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-class WriterItemResponse(BaseModel):
-    """Writer's response to one critique item: either accept (and revise) or reject (with rationale)."""
-
+class WriterItemResponse(_Strict):
     item_id: int
     action: WriterAction
-    rationale: str | None = Field(
-        default=None,
-        description="Required when action=reject. Why the writer disagrees.",
-    )
-    change_summary: str | None = Field(
-        default=None,
-        description="When action=accept, brief note about what was changed.",
-    )
+    rationale: str | None = Field(default=None, description="Required when action=reject.")
+    change_summary: str | None = Field(default=None, description="Required when action=accept.")
+
+    @model_validator(mode="after")
+    def _validate_action_fields(self) -> WriterItemResponse:
+        if self.action == WriterAction.REJECT and not self.rationale:
+            raise ValueError("rationale is required when action=reject")
+        if self.action == WriterAction.ACCEPT and not self.change_summary:
+            raise ValueError("change_summary is required when action=accept")
+        return self
 
 
-class WriterResponseBundle(BaseModel):
-    """Writer's full response across all critique items, plus updated diff."""
+class WriterResponseBundle(_Strict):
+    """Writer's per-item responses plus updated diff."""
 
     responses: list[WriterItemResponse]
-    revised_diff_summary: str = Field(
-        description="One-paragraph description of what the revision actually changed."
-    )
+    revised_diff: str = Field(description="Unified diff against base_ref after revision.")
+    revised_diff_summary: str
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Reviewer → orchestrator (rebuttal pass)
+# Reviewer rebuttal
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-class ReviewerRebuttalItem(BaseModel):
-    """Reviewer's verdict on one writer-defended (rejected) item."""
-
+class ReviewerRebuttalItem(_Strict):
     item_id: int
-    verdict: Literal["accept_writer_rationale", "still_disputed"]
+    verdict: ItemRebuttalVerdict
     rebuttal_reasoning: str | None = Field(
-        default=None,
-        description="Required when verdict=still_disputed. Why the writer's rationale doesn't hold.",
+        default=None, description="Required when verdict=still_disputed."
     )
 
+    @model_validator(mode="after")
+    def _validate_disputed_requires_reasoning(self) -> ReviewerRebuttalItem:
+        if self.verdict == ItemRebuttalVerdict.STILL_DISPUTED and not self.rebuttal_reasoning:
+            raise ValueError("rebuttal_reasoning is required when verdict=still_disputed")
+        return self
 
-class ReviewerRebuttal(BaseModel):
-    """Reviewer's final pass after the writer's per-item responses."""
 
+class ReviewerRebuttal(_Strict):
+    reviewer_id: str | None = None
     verdict: RebuttalVerdict
     item_rebuttals: list[ReviewerRebuttalItem] = Field(default_factory=list)
-    summary: str = Field(description="One-paragraph wrap-up.")
+    summary: str
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Run configuration & result (orchestrator-level)
+# Per-round trajectory (audit + v1.5 auto-journal)
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-class AgentConfig(BaseModel):
+class RevisionRound(_Strict):
+    """One write → review → respond → rebut cycle. RunResult holds a list of these."""
+
+    round_number: int = Field(ge=1)
+    writer_report: WriterReport
+    reviewer_critique: ReviewerCritique
+    writer_responses: WriterResponseBundle | None = Field(
+        default=None,
+        description="None when reviewer approved on initial pass (no revision needed).",
+    )
+    reviewer_rebuttal: ReviewerRebuttal | None = Field(
+        default=None, description="None when there were no rejected items to rebut."
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Disputes, dissents, arbitration
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class DisputedItem(_Strict):
+    """Writer + reviewer could not agree. Escalated to user for arbitration."""
+
+    item: CritiqueItem
+    writer_response: WriterItemResponse
+    reviewer_rebuttal_item: ReviewerRebuttalItem
+
+
+class AcknowledgedDissent(_Strict):
+    """Writer rejected; reviewer accepted the rationale. Ships, noted in audit log."""
+
+    item: CritiqueItem
+    writer_response: WriterItemResponse
+
+
+class ArbitrationDecision(_Strict):
+    """User's resolution of one disputed item, supplied to `dialectic arbitrate`."""
+
+    item_id: int
+    choice: ArbitrationChoice
+    note: str | None = None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Run configuration
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+_EFFORT_BY_CLI: dict[AgentCli, type[Enum]] = {
+    AgentCli.CLAUDE: ClaudeEffort,
+    AgentCli.CODEX: CodexEffort,
+}
+
+
+class AgentConfig(_Strict):
     cli: AgentCli
     model: str
-    effort: str = Field(default="max", description="low | medium | high | xhigh | max")
+    effort: str = Field(
+        default="max",
+        description="Per-cli validated in RunConfig. Codex tops out at 'xhigh' — 'max' is Claude-only.",
+    )
 
 
-class RunConfig(BaseModel):
+class RunConfig(_Strict):
     prompt: str
-    writer: AgentConfig = AgentConfig(cli=AgentCli.CLAUDE, model="claude-opus-4-7", effort="max")
-    reviewer: AgentConfig = AgentConfig(cli=AgentCli.CODEX, model="gpt-5.4", effort="xhigh")
+    writer: AgentConfig = Field(
+        default_factory=lambda: AgentConfig(
+            cli=AgentCli.CLAUDE, model="claude-opus-4-7", effort="max"
+        )
+    )
+    reviewer: AgentConfig = Field(
+        default_factory=lambda: AgentConfig(cli=AgentCli.CODEX, model="gpt-5.4", effort="xhigh")
+    )
     max_revisions: int = Field(default=1, ge=0, le=5)
     timeout_per_agent_s: int = Field(default=1500, description="25 minutes default.")
     max_diff_lines: int = Field(default=1000)
     apply_mode: ApplyMode = ApplyMode.UNCOMMITTED
     branch_name: str | None = None
-    base_ref: str = Field(default="HEAD", description="Git ref to branch worktrees from.")
-    sandbox: str = Field(default="workspace-write")
+    base_ref: str = Field(default="HEAD")
+    sandbox: SandboxMode = SandboxMode.WORKSPACE_WRITE
     context_file: Path | None = Field(
         default=None, description="Defaults to .dialectic/context.md if present."
     )
+    journal_file: Path | None = Field(
+        default=None, description="v1.5: .dialectic/journal.md for past-run context."
+    )
+    keep_worktrees: bool = Field(
+        default=False, description="Keep worktrees on failure for debugging."
+    )
+
+    @model_validator(mode="after")
+    def _validate_efforts(self) -> RunConfig:
+        for label, cfg in [("writer", self.writer), ("reviewer", self.reviewer)]:
+            valid_enum = _EFFORT_BY_CLI[cfg.cli]
+            try:
+                valid_enum(cfg.effort)
+            except ValueError as exc:
+                raise ValueError(
+                    f"{label}.effort '{cfg.effort}' is not valid for cli={cfg.cli.value}; "
+                    f"choose from {[v.value for v in valid_enum]}"
+                ) from exc
+        return self
 
 
-class DisputedItem(BaseModel):
-    """A critique item that writer + reviewer could not resolve. Escalated to user."""
-
-    item: CritiqueItem
-    writer_rationale: str
-    reviewer_rebuttal: str
+# ──────────────────────────────────────────────────────────────────────────────
+# Run result
+# ──────────────────────────────────────────────────────────────────────────────
 
 
-class AcknowledgedDissent(BaseModel):
-    """Writer rejected an item; reviewer accepted the writer's rationale. Ships, noted in log."""
-
-    item: CritiqueItem
-    writer_rationale: str
-
-
-class RunResult(BaseModel):
-    """End-of-run structured output. Presented to the user for approval."""
+class RunResult(_Strict):
+    """End-of-run structured output. Persisted to .dialectic/runs/<id>.json."""
 
     run_id: str
     status: RunStatus
@@ -210,10 +397,17 @@ class RunResult(BaseModel):
     diff: str = Field(default="", description="Final consensus unified diff against base_ref.")
     files_changed: list[str] = Field(default_factory=list)
 
-    revisions_used: int = 0
+    rounds: list[RevisionRound] = Field(
+        default_factory=list,
+        description="Full trajectory: every writer/reviewer exchange in this run.",
+    )
     resolved_items: list[CritiqueItem] = Field(default_factory=list)
     disputed_items: list[DisputedItem] = Field(default_factory=list)
     acknowledged_dissents: list[AcknowledgedDissent] = Field(default_factory=list)
+    arbitration: list[ArbitrationDecision] = Field(
+        default_factory=list,
+        description="User's resolutions for disputed items (empty until arbitration completes).",
+    )
 
     summary: str = Field(default="", description="Human-readable wrap-up shown at approval time.")
 
@@ -240,19 +434,22 @@ class EventType(str, Enum):
     REVIEWER_PROGRESS = "reviewer_progress"
     REVIEWER_DONE = "reviewer_done"
     REVISION_STARTED = "revision_started"
+    REVISION_PROGRESS = "revision_progress"
     REVISION_DONE = "revision_done"
+    REBUTTAL_STARTED = "rebuttal_started"
     REBUTTAL_DONE = "rebuttal_done"
     DIFF_READY = "diff_ready"
     AWAITING_APPROVAL = "awaiting_approval"
+    AWAITING_ARBITRATION = "awaiting_arbitration"
     APPLIED = "applied"
     REJECTED = "rejected"
     ERROR = "error"
     RUN_FINISHED = "run_finished"
 
 
-class StreamEvent(BaseModel):
+class StreamEvent(_Strict):
     event_type: EventType
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     run_id: str
     message: str = ""
-    payload: dict = Field(default_factory=dict)
+    payload: dict[str, Any] = Field(default_factory=dict)

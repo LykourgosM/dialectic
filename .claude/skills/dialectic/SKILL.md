@@ -5,7 +5,7 @@ description: Run a coding task through the dialectic protocol — Claude (Opus) 
 
 # dialectic
 
-You are dispatching a coding task to the `dialectic` orchestrator. The orchestrator runs Claude as the writer and Codex as the reviewer in isolated git worktrees, executes a structured critique-and-defend protocol between them, and produces a consensus diff. Your job is to invoke it and surface the result for user approval.
+You are dispatching a coding task to the `dialectic` orchestrator. The orchestrator runs Claude as the writer and Codex as the reviewer in isolated git worktrees, executes a structured critique-and-defend protocol between them, and produces a consensus diff with explicit user arbitration on anything the two models couldn't resolve.
 
 ## Procedure
 
@@ -13,33 +13,61 @@ You are dispatching a coding task to the `dialectic` orchestrator. The orchestra
    ```
    dialectic run --prompt "$ARGS" --stream
    ```
-   `$ARGS` is the prompt the user passed after `/dialectic`. Quote it.
+   `$ARGS` is the user's prompt after `/dialectic`. Quote it.
 
-2. **Stream events** to the user as they arrive. The orchestrator emits one line per event; show them in real time so the user can see progress (`Writer reading src/foo.py...`, `Reviewer analyzing diff (3 files)...`, etc.). Do NOT batch.
+2. **Stream events to the user as they arrive.** The orchestrator emits one event per line (JSON if `--stream --json`, otherwise human-readable). Display them in real time so the user can see progress (`Writer reading src/foo.py...`, `Reviewer analyzing diff (3 files)...`, `Writer revising 2 items, defending 1...`). Do NOT batch.
 
-3. **At end-of-run**, the orchestrator prints a structured summary including the consensus diff and any items the writer and reviewer could not agree on. Display:
-   - File-by-file diff summary (count of files changed, lines added/removed)
-   - The summary string (`"Reviewer raised 3 items, writer addressed 2 and defended 1, reviewer accepted the defense."`)
-   - Any **disputed items** as a clearly-marked block — these are items the user must arbitrate
+3. **At end-of-run** the orchestrator persists a `RunResult` and prints its `run_id` + summary. Inspect `RunResult.status`:
 
-4. **Ask for approval.** If there are disputed items, present each one with both perspectives and ask the user to pick a resolution per item. If there are no disputes, ask: approve / reject / view full diff.
+   - **`AWAITING_APPROVAL`** — writer and reviewer reached consensus. Show the user:
+     - File-by-file diff summary (count of files, lines added/removed)
+     - The `summary` string
+     - Any `acknowledged_dissents` (items the writer rejected and the reviewer accepted; these ship but are noted in the audit log)
+     - Then ask: **approve / reject / view full diff**
+     - On approve → run `dialectic approve <run-id>`
+     - On reject → run `dialectic reject <run-id>`
 
-5. **On approval:** run `dialectic approve <run-id>` to apply the diff to the user's working tree (uncommitted, on their current branch). The run-id is in the orchestrator's final output.
+   - **`AWAITING_ARBITRATION`** — the writer and reviewer could not agree on one or more items. Show the user each disputed item with both perspectives:
+     ```
+     Item #N (file:lines) — [issue]
+       Writer (Claude):  [writer_response.rationale]
+       Reviewer (Codex): [reviewer_rebuttal_item.rebuttal_reasoning]
+       Pick: [a] accept writer's choice
+             [b] accept reviewer's suggested fix
+             [s] skip (ship as-is, note in audit log)
+     ```
+     Collect the user's resolution for every disputed item, then run:
+     ```
+     dialectic arbitrate <run-id> \
+       --accept-writer <id> --accept-writer <id> \
+       --accept-reviewer <id> \
+       --skip <id>
+     ```
+     This moves the run to `AWAITING_APPROVAL`. Then re-display the consensus diff and ask for approval as above.
 
-6. **On rejection:** run `dialectic reject <run-id>`. No changes touch the user's repo.
+   - **`FAILED` / `TIMED_OUT`** — surface the `error` field and the run_id (so the user can inspect the audit log at `.dialectic/runs/<run-id>.json`). Don't retry automatically.
+
+4. **On approval**, after `dialectic approve <run-id>` succeeds, confirm to the user:
+   ```
+   ✓ Applied <N> files (<+X −Y> lines) to your working tree (uncommitted, on <current branch>).
+     Run `git diff` to review, then commit when ready.
+   ```
 
 ## What you should NOT do
 
 - Do not re-invent the dialectic loop yourself — the binary does it. Just run it.
-- Do not silently swallow disputed items. They must be surfaced for user arbitration.
+- Do not silently swallow disputed items. Every disputed item needs a user-supplied resolution before approve will succeed.
 - Do not approve on the user's behalf. They are the final arbiter.
 - Do not commit changes (the orchestrator applies uncommitted by default; the user commits when ready).
+- Do not pass `--auto-approve` unless the user explicitly asked for unattended runs.
 
 ## Flags worth knowing
 
-- `--apply-mode branch` — create a new branch `orchestrate/run-<timestamp>` instead of applying uncommitted
+- `--dry-run` — show the diff without applying anything (shortcut for `--apply-mode dry_run`)
+- `--apply-mode branch [--branch-name NAME]` — create a new branch instead of applying uncommitted
 - `--max-revisions N` — allow N rounds of writer revision (default 1; ceiling 5)
-- `--dry-run` — show the diff without applying anything
-- `--writer-model`, `--reviewer-model` — override defaults (Claude Opus 4.7 / Codex GPT-5.4)
+- `--writer-model` / `--reviewer-model` — override defaults (Claude Opus 4.7 / Codex GPT-5.4)
+- `--writer-cli` / `--reviewer-cli` — swap which family writes vs. reviews (rotated experiments)
+- `--keep-worktrees` — keep `.dialectic/wt/<run-id>/` on failure for debugging
 
 Don't add flags unless the user asked for the behavior.
