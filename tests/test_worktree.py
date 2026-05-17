@@ -114,3 +114,75 @@ def test_apply_to_existing_branch_refuses(tmp_git_repo: Path) -> None:
         wt.apply_diff_to_new_branch(
             tmp_git_repo, "", "exists", wt.current_head_sha(tmp_git_repo), "x"
         )
+
+
+def test_apply_refuses_diff_touching_git_paths(tmp_git_repo: Path) -> None:
+    """Security regression: diffs may not write into .git/ (e.g., hooks)."""
+    malicious = (
+        "diff --git a/.git/hooks/post-commit b/.git/hooks/post-commit\n"
+        "new file mode 100755\n"
+        "--- /dev/null\n"
+        "+++ b/.git/hooks/post-commit\n"
+        "@@ -0,0 +1,1 @@\n"
+        "+touch /tmp/owned\n"
+    )
+    with pytest.raises(wt.GitError, match="restricted paths"):
+        wt.apply_diff_to_working_tree(tmp_git_repo, malicious)
+
+
+def test_apply_refuses_diff_with_parent_traversal(tmp_git_repo: Path) -> None:
+    malicious = (
+        "diff --git a/../../escape.txt b/../../escape.txt\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/../../escape.txt\n"
+        "@@ -0,0 +1,1 @@\n"
+        "+pwned\n"
+    )
+    with pytest.raises(wt.GitError, match="restricted paths"):
+        wt.apply_diff_to_working_tree(tmp_git_repo, malicious)
+
+
+def test_apply_to_new_branch_refuses_invalid_branch_name(tmp_git_repo: Path) -> None:
+    """Branch names must match [A-Za-z0-9._/-]+ — prevents --upload-pack-style injection."""
+    with pytest.raises(wt.GitError, match="Invalid branch name"):
+        wt.apply_diff_to_new_branch(
+            tmp_git_repo, "", "--upload-pack=evil",
+            wt.current_head_sha(tmp_git_repo), "x",
+        )
+
+
+def test_keyboard_interrupt_triggers_keep_on_failure(tmp_git_repo: Path) -> None:
+    """BaseException (including KeyboardInterrupt) must mark failed=True so
+    keep_on_failure is honored."""
+    paths: list[Path] = []
+    with pytest.raises(KeyboardInterrupt):
+        with wt.worktree_pair(tmp_git_repo, "20260517-001-aabbcc", "HEAD", keep_on_failure=True) as pair:
+            paths = [pair.writer_path, pair.reviewer_path]
+            raise KeyboardInterrupt()
+    assert all(p.exists() for p in paths), "Worktrees should be preserved on KeyboardInterrupt"
+    # Manual cleanup so we don't pollute the test fixture.
+    pair_for_cleanup = wt.WorktreePair(
+        run_id="20260517-001-aabbcc", repo_root=tmp_git_repo,
+        writer_path=paths[0], reviewer_path=paths[1],
+        base_ref="HEAD", base_sha=wt.current_head_sha(tmp_git_repo),
+    )
+    wt.cleanup(pair_for_cleanup)
+
+
+def test_working_tree_clean_handles_renames(tmp_git_repo: Path) -> None:
+    """A rename outside .dialectic/ should mark the tree as dirty (not parse as one path)."""
+    subprocess.run(
+        ["git", "mv", "main.py", "renamed.py"], cwd=tmp_git_repo, check=True
+    )
+    assert not wt.working_tree_is_clean(tmp_git_repo)
+
+
+def test_in_progress_git_operation_detects_merge(tmp_git_repo: Path) -> None:
+    """Touch .git/MERGE_HEAD and assert detection."""
+    (tmp_git_repo / ".git" / "MERGE_HEAD").write_text(wt.current_head_sha(tmp_git_repo) + "\n")
+    assert wt.in_progress_git_operation(tmp_git_repo) == "MERGE_HEAD"
+
+
+def test_in_progress_git_operation_returns_none_when_clean(tmp_git_repo: Path) -> None:
+    assert wt.in_progress_git_operation(tmp_git_repo) is None

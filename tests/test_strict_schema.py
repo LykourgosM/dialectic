@@ -60,3 +60,49 @@ def test_any_of_ref_null_kept_as_anyof() -> None:
     assert "anyOf" in wr_field
     assert any("$ref" in b for b in wr_field["anyOf"])
     assert any(_is_null_schema(b) for b in wr_field["anyOf"])
+
+
+def test_strict_drops_unsupported_format() -> None:
+    """`format: 'path'` from pydantic Path fields is stripped (not in OpenAI strict whitelist)."""
+    schema = {
+        "type": "object",
+        "properties": {
+            "p": {"type": "string", "format": "path"},
+            "ts": {"type": "string", "format": "date-time"},
+        },
+    }
+    strict = _make_strict_schema(schema)
+    assert "format" not in strict["properties"]["p"]
+    # date-time IS in the whitelist
+    assert strict["properties"]["ts"]["format"] == "date-time"
+
+
+def test_strict_object_without_properties_gets_well_formed() -> None:
+    """A bare `type: object` (e.g. from dict[str, Any]) gets properties:{}, required:[]."""
+    schema = {"type": "object"}
+    strict = _make_strict_schema(schema)
+    assert strict["additionalProperties"] is False
+    assert strict["properties"] == {}
+    assert strict["required"] == []
+
+
+def test_strict_three_way_union_left_alone() -> None:
+    """anyOf with 3+ branches isn't flattened (would require multi-type or extra logic)."""
+    schema = {
+        "type": "object",
+        "properties": {
+            "x": {"anyOf": [{"type": "string"}, {"type": "integer"}, {"type": "null"}]},
+        },
+    }
+    strict = _make_strict_schema(schema)
+    assert "anyOf" in strict["properties"]["x"]
+    assert len(strict["properties"]["x"]["anyOf"]) == 3
+
+
+def test_is_null_schema_tolerates_title() -> None:
+    """Future pydantic versions may include a `title` on null schemas; still recognized as null."""
+    assert _is_null_schema({"type": "null"})
+    assert _is_null_schema({"type": "null", "title": "Foo"})
+    assert _is_null_schema({"type": "null", "title": "Foo", "description": "x"})
+    assert not _is_null_schema({"type": "null", "extra": 1})
+    assert not _is_null_schema({"type": "string"})

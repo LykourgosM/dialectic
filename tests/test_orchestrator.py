@@ -885,6 +885,210 @@ async def test_stream_events_include_revision_and_rebuttal(tmp_git_repo: Path) -
 
 
 @pytest.mark.asyncio
+async def test_max_revisions_two_full_iteration(tmp_git_repo: Path) -> None:
+    """max_revisions=2: round1 revise→accept-all → round2 revise→accept-all → round3 approve."""
+    writer_calls = 0
+
+    async def fake_writer(prompt, cfg, cwd, schema, perm, timeout):
+        nonlocal writer_calls
+        writer_calls += 1
+        if writer_calls == 1:
+            (cwd / "main.py").write_text("v1\n")
+            return claude_ok(writer_report_dict())
+        elif writer_calls == 2:
+            (cwd / "main.py").write_text("v2\n")
+            return claude_ok(
+                writer_responses_dict([{"item_id": 1, "action": "accept", "change_summary": "v2"}])
+            )
+        else:
+            (cwd / "main.py").write_text("v3\n")
+            return claude_ok(
+                writer_responses_dict([{"item_id": 2, "action": "accept", "change_summary": "v3"}])
+            )
+
+    reviewer_calls = 0
+
+    async def fake_reviewer(prompt, cfg, cwd, schema, sandbox, timeout):
+        nonlocal reviewer_calls
+        reviewer_calls += 1
+        if reviewer_calls == 1:
+            return codex_ok(critique_dict("revise", [critique_item_dict(1, "round 1 issue")]))
+        elif reviewer_calls == 2:
+            return codex_ok(critique_dict("revise", [critique_item_dict(2, "round 2 issue")]))
+        else:
+            return codex_ok(critique_dict("approve", []))
+
+    cfg = p.RunConfig(prompt="x", max_revisions=2)
+    result = await core.run(
+        cfg, tmp_git_repo, writer_invoke=fake_writer, reviewer_invoke=fake_reviewer
+    )
+
+    assert result.status == p.RunStatus.AWAITING_APPROVAL
+    assert len(result.rounds) == 3
+    assert result.rounds[0].reviewer_critique.verdict == p.ReviewerVerdict.REVISE
+    assert result.rounds[1].reviewer_critique.verdict == p.ReviewerVerdict.REVISE
+    assert result.rounds[2].reviewer_critique.verdict == p.ReviewerVerdict.APPROVE
+    # Writer called: initial + revision1 + revision2 = 3 (NOT 4 — the refactor
+    # removed the wasted top-of-loop writer call)
+    assert writer_calls == 3
+    # Items accepted across rounds 1+2 should both be in resolved
+    assert len(result.resolved_items) >= 2
+    assert "v3" in result.diff
+
+
+@pytest.mark.asyncio
+async def test_max_revisions_exhausted_lists_unresolved(tmp_git_repo: Path) -> None:
+    """max_revisions=0: critique items raised → status=AWAITING_ARBITRATION with unresolved items."""
+
+    async def fake_writer(prompt, cfg, cwd, schema, perm, timeout):
+        (cwd / "main.py").write_text("changed\n")
+        return claude_ok(writer_report_dict())
+
+    async def fake_reviewer(prompt, cfg, cwd, schema, sandbox, timeout):
+        return codex_ok(
+            critique_dict(
+                "revise",
+                [critique_item_dict(1, "x", severity="high"), critique_item_dict(2, "y")],
+            )
+        )
+
+    result = await core.run(
+        p.RunConfig(prompt="x", max_revisions=0),
+        tmp_git_repo,
+        writer_invoke=fake_writer,
+        reviewer_invoke=fake_reviewer,
+    )
+    assert result.status == p.RunStatus.AWAITING_ARBITRATION
+    assert len(result.unresolved_items) == 2
+    assert {item.id for item in result.unresolved_items} == {1, 2}
+    assert result.disputed_items == []
+
+
+@pytest.mark.asyncio
+async def test_reviewer_outright_reject_marks_failed(tmp_git_repo: Path) -> None:
+    async def fake_writer(prompt, cfg, cwd, schema, perm, timeout):
+        (cwd / "main.py").write_text("bad\n")
+        return claude_ok(writer_report_dict())
+
+    async def fake_reviewer(prompt, cfg, cwd, schema, sandbox, timeout):
+        return codex_ok(critique_dict("reject", [], summary="approach is fundamentally wrong"))
+
+    result = await core.run(
+        p.RunConfig(prompt="x"),
+        tmp_git_repo,
+        writer_invoke=fake_writer,
+        reviewer_invoke=fake_reviewer,
+    )
+    assert result.status == p.RunStatus.FAILED
+    assert "rejected outright" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_writer_crashes_after_reviewer_succeeded_partial_state(tmp_git_repo: Path) -> None:
+    """Failure cascade: writer-response crashes after reviewer's initial critique succeeded.
+
+    The result should be FAILED but the first round's writer_report and reviewer_critique
+    should still be captured in result.rounds for forensics.
+    """
+    writer_calls = 0
+
+    async def fake_writer(prompt, cfg, cwd, schema, perm, timeout):
+        nonlocal writer_calls
+        writer_calls += 1
+        if writer_calls == 1:
+            (cwd / "main.py").write_text("v1\n")
+            return claude_ok(writer_report_dict())
+        return ClaudeResult(raw_text="", is_error=True, error="writer crashed mid-revision")
+
+    async def fake_reviewer(prompt, cfg, cwd, schema, sandbox, timeout):
+        return codex_ok(critique_dict("revise", [critique_item_dict(1, "x")]))
+
+    result = await core.run(
+        p.RunConfig(prompt="x", max_revisions=1),
+        tmp_git_repo,
+        writer_invoke=fake_writer,
+        reviewer_invoke=fake_reviewer,
+    )
+    assert result.status == p.RunStatus.FAILED
+    assert "writer crashed" in (result.error or "")
+    # Partial trajectory still in audit
+    assert len(result.rounds) == 0  # round didn't make it into the list (crashed before append)
+    # But the audit log captured the writer's initial report AND the reviewer's critique
+    audit = tmp_git_repo / ".dialectic" / "runs" / f"{result.run_id}.prompts.jsonl"
+    assert audit.exists()
+    entries = [json.loads(l) for l in audit.read_text().splitlines() if l.strip()]
+    phases = [e["phase"] for e in entries]
+    assert "writer_initial" in phases
+    assert "reviewer_critique" in phases
+    assert "writer_response" in phases  # the failing call IS still logged
+
+
+@pytest.mark.asyncio
+async def test_dry_run_preserves_awaiting_approval(tmp_git_repo: Path) -> None:
+    """dry_run + auto-approve doesn't flip status to SUCCESS, so a later `approve` still works."""
+
+    async def fake_writer(prompt, cfg, cwd, schema, perm, timeout):
+        (cwd / "main.py").write_text("def greet(name):\n    return f'hi {name}'\n")
+        return claude_ok(writer_report_dict())
+
+    async def fake_reviewer(prompt, cfg, cwd, schema, sandbox, timeout):
+        return codex_ok(critique_dict("approve", []))
+
+    cfg = p.RunConfig(prompt="x", apply_mode=p.ApplyMode.DRY_RUN)
+    result = await core.run(
+        cfg, tmp_git_repo, writer_invoke=fake_writer, reviewer_invoke=fake_reviewer
+    )
+    applied = core.apply_run_result(result, tmp_git_repo)
+    # Dry run should keep status as AWAITING_APPROVAL so user can change apply_mode
+    # and approve for real.
+    assert applied.status == p.RunStatus.AWAITING_APPROVAL
+
+
+@pytest.mark.asyncio
+async def test_base_sha_captured_not_re_resolved(tmp_git_repo: Path) -> None:
+    """RunResult.base_sha is the SHA at run start; apply uses it (not re-resolves HEAD)."""
+    import subprocess
+
+    async def fake_writer(prompt, cfg, cwd, schema, perm, timeout):
+        (cwd / "main.py").write_text("v1\n")
+        return claude_ok(writer_report_dict())
+
+    async def fake_reviewer(prompt, cfg, cwd, schema, sandbox, timeout):
+        return codex_ok(critique_dict("approve", []))
+
+    original_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=tmp_git_repo, capture_output=True, text=True
+    ).stdout.strip()
+
+    result = await core.run(
+        p.RunConfig(prompt="x"),
+        tmp_git_repo,
+        writer_invoke=fake_writer,
+        reviewer_invoke=fake_reviewer,
+    )
+    assert result.base_sha == original_sha
+
+    # Now move HEAD by committing something else.
+    (tmp_git_repo / "other.py").write_text("other\n")
+    subprocess.run(["git", "add", "-A"], cwd=tmp_git_repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "another commit"], cwd=tmp_git_repo, check=True)
+
+    with pytest.raises(RuntimeError, match="HEAD moved"):
+        core.apply_run_result(result, tmp_git_repo)
+
+
+@pytest.mark.asyncio
+async def test_load_run_record_rejects_path_traversal(tmp_git_repo: Path) -> None:
+    """Security regression: malformed run_ids must be rejected before disk access."""
+    with pytest.raises(ValueError, match="Invalid run_id"):
+        core.load_run_record("../../etc/passwd", tmp_git_repo)
+    with pytest.raises(ValueError, match="Invalid run_id"):
+        core.load_run_record("not_a_run_id", tmp_git_repo)
+    with pytest.raises(ValueError, match="Invalid run_id"):
+        core.load_run_record("20260517-120000-XYZ123", tmp_git_repo)  # uppercase not hex
+
+
+@pytest.mark.asyncio
 async def test_diff_exceeds_max_lines_aborts(tmp_git_repo: Path) -> None:
     async def fake_writer(prompt, cfg, cwd, schema, perm, timeout):
         # Write a huge file
