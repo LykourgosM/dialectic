@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import click
 from rich.console import Console
 from rich.panel import Panel
 from rich.syntax import Syntax
+from rich.table import Table
 
 from . import core
 from .protocol import (
@@ -246,6 +248,65 @@ def arbitrate(  # noqa: PLR0913
     _render_result(result)
 
 
+@main.command("list-runs")
+@click.option(
+    "--repo-root",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=".",
+)
+def list_runs(repo_root: Path) -> None:
+    """Print the 10 most recent runs as a table."""
+    repo_root = repo_root.resolve()
+    runs_dir = repo_root / ".dialectic" / "runs"
+    if not runs_dir.is_dir():
+        console.print("[dim]No runs found (.dialectic/runs/ does not exist).[/dim]")
+        return
+
+    results: list[RunResult] = []
+    for path in runs_dir.glob("*.json"):
+        try:
+            results.append(RunResult.model_validate_json(path.read_text()))
+        except Exception as exc:
+            console.print(f"[yellow]warning: skipping {path.name} ({exc})[/yellow]")
+
+    if not results:
+        console.print("[dim]No runs found.[/dim]")
+        return
+
+    epoch = datetime.min.replace(tzinfo=timezone.utc)
+    results.sort(key=lambda r: r.started_at or epoch, reverse=True)
+    results = results[:10]
+
+    status_color = {
+        RunStatus.SUCCESS: "green",
+        RunStatus.APPLIED_WITH_DISSENT: "green",
+        RunStatus.AWAITING_APPROVAL: "yellow",
+        RunStatus.AWAITING_ARBITRATION: "yellow",
+        RunStatus.REJECTED_BY_USER: "red",
+        RunStatus.FAILED: "red",
+        RunStatus.TIMED_OUT: "red",
+    }
+
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("run_id", style="cyan", no_wrap=True)
+    table.add_column("status")
+    table.add_column("prompt")
+    table.add_column("cost", justify="right")
+    table.add_column("duration", justify="right")
+
+    for r in results:
+        color = status_color.get(r.status, "white")
+        table.add_row(
+            r.run_id[-8:],
+            f"[{color}]{r.status.value}[/{color}]",
+            _truncate_prompt(r.config.prompt, 60),
+            f"${r.cost_usd:.4f}",
+            f"{r.duration_s:.1f}s",
+        )
+
+    console.print(table)
+
+
 @main.command()
 @click.option("--host", default="127.0.0.1")
 @click.option("--port", default=8765, type=int)
@@ -259,6 +320,13 @@ def serve(host: str, port: int) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 # Rendering helpers
 # ──────────────────────────────────────────────────────────────────────────────
+
+
+def _truncate_prompt(text: str, max_len: int) -> str:
+    collapsed = " ".join(text.split())
+    if len(collapsed) <= max_len:
+        return collapsed
+    return collapsed[: max_len - 1] + "…"
 
 
 def _render_result(result: RunResult) -> None:
