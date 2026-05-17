@@ -12,6 +12,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.table import Table
+from rich.tree import Tree
 
 from . import core
 from .protocol import (
@@ -20,10 +21,20 @@ from .protocol import (
     ApplyMode,
     ArbitrationChoice,
     ArbitrationDecision,
+    ItemRebuttalVerdict,
+    RebuttalVerdict,
+    ReviewerCritique,
+    ReviewerRebuttal,
+    ReviewerVerdict,
+    RevisionRound,
     RunConfig,
     RunResult,
     RunStatus,
     SandboxMode,
+    Severity,
+    WriterAction,
+    WriterReport,
+    WriterResponseBundle,
 )
 
 console = Console()
@@ -381,6 +392,24 @@ def costs(repo_root: Path) -> None:
     )
 
 
+@main.command("show")
+@click.argument("run_id")
+@click.option(
+    "--repo-root",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=".",
+)
+def show_cmd(run_id: str, repo_root: Path) -> None:
+    """Pretty-print a single run's full trajectory."""
+    repo_root = repo_root.resolve()
+    try:
+        result = core.load_run_record(run_id, repo_root)
+    except (ValueError, FileNotFoundError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        sys.exit(1)
+    _render_trajectory(result)
+
+
 @main.command()
 @click.option("--host", default="127.0.0.1")
 @click.option("--port", default=8765, type=int)
@@ -459,6 +488,165 @@ def _render_result(result: RunResult) -> None:
 
     if result.error:
         console.print(f"\n[red]Error:[/red] {result.error}")
+
+
+def _render_trajectory(result: RunResult) -> None:
+    """Pretty-print every round of a run as nested rich.Tree under a header Panel."""
+    status_color = {
+        RunStatus.SUCCESS: "green",
+        RunStatus.APPLIED_WITH_DISSENT: "green",
+        RunStatus.AWAITING_APPROVAL: "green",
+        RunStatus.AWAITING_ARBITRATION: "yellow",
+        RunStatus.REJECTED_BY_USER: "red",
+        RunStatus.FAILED: "red",
+        RunStatus.TIMED_OUT: "red",
+    }.get(result.status, "white")
+    header_lines = [
+        f"[bold]Run {result.run_id}[/bold]  "
+        f"[{status_color}]{result.status.value}[/{status_color}]  "
+        f"·  {result.duration_s:.1f}s  ·  ${result.cost_usd:.4f}",
+        f"[dim]writer:[/dim] {result.config.writer.cli.value}/"
+        f"{result.config.writer.model}/{result.config.writer.effort}    "
+        f"[dim]reviewer:[/dim] {result.config.reviewer.cli.value}/"
+        f"{result.config.reviewer.model}/{result.config.reviewer.effort}",
+        f"[dim]prompt:[/dim] {_truncate_prompt(result.config.prompt, 200)}",
+    ]
+    console.print()
+    console.print(Panel("\n".join(header_lines), expand=False, border_style="bright_black"))
+
+    if not result.rounds:
+        console.print("[dim](no rounds executed)[/dim]")
+    for round_obj in result.rounds:
+        console.print()
+        console.print(
+            Panel(
+                _build_round_tree(round_obj),
+                title=f"Round {round_obj.round_number}",
+                border_style="cyan",
+                expand=False,
+            )
+        )
+
+    if result.summary:
+        console.print(f"\n[dim]{result.summary}[/dim]")
+    if result.error:
+        console.print(f"\n[red]Error:[/red] {result.error}")
+
+
+def _build_round_tree(round_obj: RevisionRound) -> Tree:
+    tree = Tree(f"[bold]Round {round_obj.round_number}[/bold]")
+    _attach_writer_report(tree, round_obj.writer_report)
+    _attach_critique(tree, round_obj.reviewer_critique)
+    if round_obj.writer_responses is not None:
+        _attach_writer_responses(tree, round_obj.writer_responses)
+    if round_obj.reviewer_rebuttal is not None:
+        _attach_rebuttal(tree, round_obj.reviewer_rebuttal)
+    return tree
+
+
+def _attach_writer_report(parent: Tree, report: WriterReport) -> None:
+    node = parent.add("[bold blue]Writer report[/bold blue]")
+    node.add(f"[dim]summary:[/dim] {report.summary}")
+    approaches = ", ".join(a.value for a in report.approaches) or "(none)"
+    node.add(f"[dim]approaches:[/dim] {approaches}")
+    node.add(f"[dim]confidence:[/dim] {report.confidence.value}")
+    files_node = node.add(f"[dim]files_touched ({len(report.files_touched)}):[/dim]")
+    if report.files_touched:
+        for f in report.files_touched:
+            files_node.add(f)
+    else:
+        files_node.add("[dim](none)[/dim]")
+    a_node = node.add(f"[dim]assumptions ({len(report.assumptions)}):[/dim]")
+    if report.assumptions:
+        for a in report.assumptions:
+            a_node.add(a)
+    else:
+        a_node.add("[dim](none)[/dim]")
+    q_node = node.add(f"[dim]open_questions ({len(report.open_questions)}):[/dim]")
+    if report.open_questions:
+        for q in report.open_questions:
+            q_node.add(q)
+    else:
+        q_node.add("[dim](none)[/dim]")
+
+
+def _attach_critique(parent: Tree, critique: ReviewerCritique) -> None:
+    verdict_color = {
+        ReviewerVerdict.APPROVE: "green",
+        ReviewerVerdict.REVISE: "yellow",
+        ReviewerVerdict.REJECT: "red",
+    }.get(critique.verdict, "white")
+    node = parent.add(
+        f"[bold magenta]Reviewer critique[/bold magenta]  "
+        f"verdict=[{verdict_color}]{critique.verdict.value}[/{verdict_color}]"
+    )
+    node.add(f"[dim]summary:[/dim] {critique.summary}")
+    if not critique.items:
+        node.add("[dim](no items)[/dim]")
+        return
+    for item in critique.items:
+        loc = ""
+        if item.file:
+            loc = item.file
+            if item.lines:
+                loc = f"{item.file}:{item.lines}"
+        sev_color = {
+            Severity.CRITICAL: "red",
+            Severity.HIGH: "red",
+            Severity.MEDIUM: "yellow",
+            Severity.LOW: "cyan",
+            Severity.INFO: "dim",
+        }.get(item.severity, "white")
+        cats = ", ".join(c.value for c in item.categories)
+        head = (
+            f"[bold]#{item.id}[/bold]  "
+            f"[{sev_color}]{item.severity.value}[/{sev_color}]  "
+            f"[dim]{cats}[/dim]"
+        )
+        if loc:
+            head += f"  [dim]{loc}[/dim]"
+        item_node = node.add(head)
+        item_node.add(f"[dim]issue:[/dim] {item.issue}")
+        if item.suggested_fix:
+            item_node.add(f"[dim]suggested_fix:[/dim] {item.suggested_fix}")
+
+
+def _attach_writer_responses(parent: Tree, responses: WriterResponseBundle) -> None:
+    node = parent.add("[bold blue]Writer responses[/bold blue]")
+    node.add(f"[dim]revised_diff_summary:[/dim] {responses.revised_diff_summary}")
+    for resp in responses.responses:
+        action_color = "green" if resp.action == WriterAction.ACCEPT else "yellow"
+        item_node = node.add(
+            f"[bold]#{resp.item_id}[/bold]  "
+            f"action=[{action_color}]{resp.action.value}[/{action_color}]"
+        )
+        if resp.action == WriterAction.ACCEPT and resp.change_summary:
+            item_node.add(f"[dim]change_summary:[/dim] {resp.change_summary}")
+        if resp.action == WriterAction.REJECT and resp.rationale:
+            item_node.add(f"[dim]rationale:[/dim] {resp.rationale}")
+
+
+def _attach_rebuttal(parent: Tree, rebuttal: ReviewerRebuttal) -> None:
+    verdict_color = {
+        RebuttalVerdict.APPROVE: "green",
+        RebuttalVerdict.APPROVE_WITH_DISSENT: "green",
+        RebuttalVerdict.STILL_DISPUTED: "red",
+    }.get(rebuttal.verdict, "white")
+    node = parent.add(
+        f"[bold magenta]Reviewer rebuttal[/bold magenta]  "
+        f"verdict=[{verdict_color}]{rebuttal.verdict.value}[/{verdict_color}]"
+    )
+    node.add(f"[dim]summary:[/dim] {rebuttal.summary}")
+    for rb in rebuttal.item_rebuttals:
+        rb_color = (
+            "green" if rb.verdict == ItemRebuttalVerdict.ACCEPT_WRITER_RATIONALE else "red"
+        )
+        rb_node = node.add(
+            f"[bold]#{rb.item_id}[/bold]  "
+            f"verdict=[{rb_color}]{rb.verdict.value}[/{rb_color}]"
+        )
+        if rb.rebuttal_reasoning:
+            rb_node.add(f"[dim]rebuttal_reasoning:[/dim] {rb.rebuttal_reasoning}")
 
 
 def _render_apply_summary(result: RunResult, repo_root: Path) -> None:
