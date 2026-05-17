@@ -324,6 +324,63 @@ def list_runs(repo_root: Path, limit: int) -> None:
     console.print(table)
 
 
+@main.command("costs")
+@click.option(
+    "--repo-root",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=".",
+)
+def costs(repo_root: Path) -> None:
+    """Aggregate USD spent across all runs, broken down by writer/reviewer model."""
+    repo_root = repo_root.resolve()
+    runs_dir = repo_root / ".dialectic" / "runs"
+    if not runs_dir.is_dir():
+        console.print("[dim]No runs found (.dialectic/runs/ does not exist).[/dim]")
+        return
+
+    results: list[RunResult] = []
+    for path in runs_dir.glob("*.json"):
+        try:
+            results.append(RunResult.model_validate_json(path.read_text()))
+        except Exception as exc:
+            console.print(f"[yellow]warning: skipping {path.name} ({exc})[/yellow]")
+
+    if not results:
+        console.print("[dim]No runs found.[/dim]")
+        return
+
+    # (role, model) → [runs, total_cost]. Each run contributes its full cost to
+    # both its writer-model row and its reviewer-model row — RunResult doesn't
+    # split cost per-role, so each row answers "what did runs using <model> as
+    # <role> cost in total?" rather than implying a 50/50 split.
+    agg: dict[tuple[str, str], list[float]] = {}
+    total_spent = 0.0
+    for r in results:
+        total_spent += r.cost_usd
+        for role, model in (("writer", r.config.writer.model), ("reviewer", r.config.reviewer.model)):
+            row = agg.setdefault((role, model), [0.0, 0.0])
+            row[0] += 1
+            row[1] += r.cost_usd
+
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("model", style="cyan", no_wrap=True)
+    table.add_column("role")
+    table.add_column("runs", justify="right")
+    table.add_column("cost", justify="right")
+
+    # Writers first, then reviewers; within each role, sort by cost desc.
+    for role in ("writer", "reviewer"):
+        rows = [(model, runs, cost) for (r, model), (runs, cost) in agg.items() if r == role]
+        rows.sort(key=lambda x: (-x[2], x[0]))
+        for model, runs, cost in rows:
+            table.add_row(model, role, str(int(runs)), f"${cost:.4f}")
+
+    console.print(table)
+    console.print(
+        f"\n[bold]Total spent across {len(results)} run(s):[/bold] ${total_spent:.4f}"
+    )
+
+
 @main.command()
 @click.option("--host", default="127.0.0.1")
 @click.option("--port", default=8765, type=int)
