@@ -38,9 +38,7 @@ from dialectic.protocol import (
 def wide_console(monkeypatch: pytest.MonkeyPatch) -> None:
     """Pin the CLI's rich console to wide non-terminal output so Tree rendering
     is deterministic regardless of the host terminal's width."""
-    monkeypatch.setattr(
-        cli_mod, "console", Console(width=240, force_terminal=False, no_color=True)
-    )
+    monkeypatch.setattr(cli_mod, "console", Console(width=240, force_terminal=False, no_color=True))
 
 
 def _build_synthetic_run(repo_root: Path) -> RunResult:
@@ -156,9 +154,7 @@ def test_show_renders_all_round_sections(tmp_path: Path, wide_console: None) -> 
     result = _build_synthetic_run(tmp_path)
 
     runner = CliRunner()
-    cli_result = runner.invoke(
-        main, ["show", result.run_id, "--repo-root", str(tmp_path)]
-    )
+    cli_result = runner.invoke(main, ["show", result.run_id, "--repo-root", str(tmp_path)])
 
     assert cli_result.exit_code == 0, cli_result.output
     out = cli_result.output
@@ -218,9 +214,7 @@ def test_show_renders_all_round_sections(tmp_path: Path, wide_console: None) -> 
     assert "One round, one dispute escalated" in out
 
 
-def test_show_missing_run_id_fails_gracefully(
-    tmp_path: Path, wide_console: None
-) -> None:
+def test_show_missing_run_id_fails_gracefully(tmp_path: Path, wide_console: None) -> None:
     """File-not-found should exit nonzero with a friendly message, not a traceback."""
     runner = CliRunner()
     cli_result = runner.invoke(
@@ -231,9 +225,7 @@ def test_show_missing_run_id_fails_gracefully(
     assert "No run record" in cli_result.output
 
 
-def test_show_invalid_run_id_fails_gracefully(
-    tmp_path: Path, wide_console: None
-) -> None:
+def test_show_invalid_run_id_fails_gracefully(tmp_path: Path, wide_console: None) -> None:
     """Malformed run_ids are rejected before disk access (path-traversal guard)."""
     runner = CliRunner()
     cli_result = runner.invoke(

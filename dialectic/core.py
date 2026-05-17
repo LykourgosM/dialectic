@@ -143,18 +143,30 @@ _SYSTEM_HEADER = (
 )
 
 
-def _build_writer_initial_prompt(user_prompt: str, project_context: str) -> str:
+def _build_prompt_header(role: str, user_prompt: str, project_context: str) -> list[str]:
+    """Shared header lines for any agent prompt: system note, role, task, project context.
+
+    The initial writer pass labels the task `TASK FROM USER:` because the user
+    is speaking directly to it; every subsequent phase refers back to the same
+    text as `ORIGINAL TASK:` to make the chronological framing explicit.
+    """
+    task_label = "TASK FROM USER" if role == "writer" else "ORIGINAL TASK"
     parts = [
         _SYSTEM_HEADER,
         "",
-        "ROLE: writer",
+        f"ROLE: {role}",
         "",
-        "TASK FROM USER:",
+        f"{task_label}:",
         user_prompt,
         "",
     ]
     if project_context:
         parts.extend(["PROJECT CONTEXT:", project_context, ""])
+    return parts
+
+
+def _build_writer_initial_prompt(user_prompt: str, project_context: str) -> str:
+    parts = _build_prompt_header("writer", user_prompt, project_context)
     parts.extend(
         [
             "INSTRUCTIONS:",
@@ -170,17 +182,7 @@ def _build_writer_initial_prompt(user_prompt: str, project_context: str) -> str:
 def _build_reviewer_critique_prompt(
     user_prompt: str, writer_report: WriterReport, authoritative_diff: str, project_context: str
 ) -> str:
-    parts = [
-        _SYSTEM_HEADER,
-        "",
-        "ROLE: reviewer",
-        "",
-        "ORIGINAL TASK:",
-        user_prompt,
-        "",
-    ]
-    if project_context:
-        parts.extend(["PROJECT CONTEXT:", project_context, ""])
+    parts = _build_prompt_header("reviewer", user_prompt, project_context)
     parts.extend(
         [
             "WRITER'S REPORT:",
@@ -218,17 +220,7 @@ def _build_writer_revision_prompt(
     authoritative_diff: str,
     project_context: str,
 ) -> str:
-    parts = [
-        _SYSTEM_HEADER,
-        "",
-        "ROLE: writer (revision pass)",
-        "",
-        "ORIGINAL TASK:",
-        user_prompt,
-        "",
-    ]
-    if project_context:
-        parts.extend(["PROJECT CONTEXT:", project_context, ""])
+    parts = _build_prompt_header("writer (revision pass)", user_prompt, project_context)
     parts.extend(
         [
             "YOUR PREVIOUS WORK (current state of your worktree):",
@@ -259,17 +251,7 @@ def _build_reviewer_rebuttal_prompt(
     project_context: str,
 ) -> str:
     rejected = [r for r in response_bundle.responses if r.action == WriterAction.REJECT]
-    parts = [
-        _SYSTEM_HEADER,
-        "",
-        "ROLE: reviewer (rebuttal pass)",
-        "",
-        "ORIGINAL TASK:",
-        user_prompt,
-        "",
-    ]
-    if project_context:
-        parts.extend(["PROJECT CONTEXT:", project_context, ""])
+    parts = _build_prompt_header("reviewer (rebuttal pass)", user_prompt, project_context)
     parts.extend(
         [
             "YOUR PREVIOUS CRITIQUE:",

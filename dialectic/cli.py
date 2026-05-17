@@ -368,7 +368,10 @@ def costs(repo_root: Path) -> None:
     total_spent = 0.0
     for r in results:
         total_spent += r.cost_usd
-        for role, model in (("writer", r.config.writer.model), ("reviewer", r.config.reviewer.model)):
+        for role, model in (
+            ("writer", r.config.writer.model),
+            ("reviewer", r.config.reviewer.model),
+        ):
             row = agg.setdefault((role, model), [0.0, 0.0])
             row[0] += 1
             row[1] += r.cost_usd
@@ -387,9 +390,7 @@ def costs(repo_root: Path) -> None:
             table.add_row(model, role, str(int(runs)), f"${cost:.4f}")
 
     console.print(table)
-    console.print(
-        f"\n[bold]Total spent across {len(results)} run(s):[/bold] ${total_spent:.4f}"
-    )
+    console.print(f"\n[bold]Total spent across {len(results)} run(s):[/bold] ${total_spent:.4f}")
 
 
 @main.command("show")
@@ -638,12 +639,9 @@ def _attach_rebuttal(parent: Tree, rebuttal: ReviewerRebuttal) -> None:
     )
     node.add(f"[dim]summary:[/dim] {rebuttal.summary}")
     for rb in rebuttal.item_rebuttals:
-        rb_color = (
-            "green" if rb.verdict == ItemRebuttalVerdict.ACCEPT_WRITER_RATIONALE else "red"
-        )
+        rb_color = "green" if rb.verdict == ItemRebuttalVerdict.ACCEPT_WRITER_RATIONALE else "red"
         rb_node = node.add(
-            f"[bold]#{rb.item_id}[/bold]  "
-            f"verdict=[{rb_color}]{rb.verdict.value}[/{rb_color}]"
+            f"[bold]#{rb.item_id}[/bold]  verdict=[{rb_color}]{rb.verdict.value}[/{rb_color}]"
         )
         if rb.rebuttal_reasoning:
             rb_node.add(f"[dim]rebuttal_reasoning:[/dim] {rb.rebuttal_reasoning}")
