@@ -161,12 +161,16 @@ Defaults are the highest-effort settings on both sides because that's what the c
 
 ## Status & roadmap
 
-v0.1 — protocol works end-to-end, 99 tests pass, two real runs validated. Things explicitly not in v0.1:
+**v0.2** — 121 tests, 5 real dogfood runs validated, CI green. Protocol works end-to-end including writer/reviewer/respond/rebut/arbitrate, with `base_sha`-anchored apply-time safety, audit logs, and per-run schema versioning.
 
-- `ACCEPT_REVIEWER` arbitration choice (currently `NotImplementedError`) — needs a fix-format design before it can synthesize patches from `suggested_fix`.
-- Multi-reviewer panel ([Verga et al. 2024 PoLL](https://arxiv.org/abs/2404.18796)). The protocol has `reviewer_id` ready; needs critique merging logic.
-- Auto-journal of past runs as context for future runs. Hook exists in `RunConfig.journal_file`.
-- Real-time streaming of agent stdout (Codex's JSONL events) — currently only orchestrator-level events stream to the CLI.
+### Speculative future items (not committed)
+
+These are listed for transparency, not as promises. None of them have been needed in the 5 real runs so far; I'll only build them if I (or someone using the tool) hits a case where they're actually missing.
+
+- `ACCEPT_REVIEWER` arbitration choice (currently `NotImplementedError`). Would need a design for synthesizing patches from the reviewer's free-text `suggested_fix`. None of the 5 real runs reached `AWAITING_ARBITRATION` at all, so the `ACCEPT_WRITER` / `SKIP` + manual paste escape hatch may be enough indefinitely.
+- Multi-reviewer panel ([Verga et al. 2024 PoLL](https://arxiv.org/abs/2404.18796)). The protocol has `reviewer_id` ready, so it's non-breaking to add. Would require a third CLI installed (Gemini or similar) and critique-merging logic. No evidence yet that a single Codex reviewer is missing real bugs.
+- Auto-journal of past runs as context for future runs. The `RunConfig.journal_file` hook exists; needs a writer that appends a structured entry after each successful run.
+- Real-time streaming of agent stdout. Pure ergonomic polish — current orchestrator-level events tell you "the dance is alive" but not what the agent is saying in the moment.
 
 See [`CHANGELOG.md`](./CHANGELOG.md) for the full release notes.
 
