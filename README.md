@@ -9,7 +9,7 @@
 
 I wanted a CLI tool that ran Claude Code and OpenAI Codex CLI together on the same coding task, with one writing and the other reviewing, for hackathons and longer dev sessions where I'd want a sanity check before shipping AI-generated code. Most of the existing multi-CLI orchestrators (10+ surveyed below) use voting, debate, or consensus patterns, all of which have known failure modes for code generation. So I built `dialectic` to implement the pattern the literature actually supports: a single writer, a cross-family reviewer with execution access, structured per-item disagreement, and the human as the final arbiter when the two LLMs can't agree.
 
-It's been validated by two real dogfood runs against this codebase itself: a `list-runs` subcommand ($2.34, 8.4 min) and a `--limit` flag for that subcommand ($0.76, 4.2 min). Both diffs were genuinely good code, and the second run caught a real test bug the first run's inspection-only review had missed.
+Validated by real dogfood runs against this codebase itself — the orchestrator wrote several of its own features. Concrete head-to-head evidence vs. solo Claude is in the [Head-to-head](#head-to-head-dialectic-vs-solo-claude) section below.
 
 ## Quickstart
 
@@ -96,17 +96,6 @@ Each agent invocation runs in an ephemeral `.dialectic/wt/{writer,reviewer}-<id>
 
 See [`docs/architecture.md`](./docs/architecture.md) for a fuller diagram and the exact safety checks at apply time.
 
-## Two real runs
-
-These are the actual cost / duration / outcome of running dialectic on this codebase itself. Both are persisted in `.dialectic/runs/`.
-
-| Run | Prompt | Outcome | Writer | Reviewer | Total |
-|---|---|---|---|---|---|
-| 1 | "Add a `dialectic list-runs` subcommand …" | Approved on first pass; reviewer admitted "approval is based on code inspection" because sandbox blocked tmpdir | $2.21, 6.6 min | $0.14, 1.8 min | **$2.34, 8.4 min** |
-| 2 | "Add a `--limit N` flag to `dialectic list-runs` …" | Approved on first pass; reviewer **executed pytest, ran the CLI, ran `git diff --check`**, and **caught an unrelated existing test bug** in the process | $0.63, 1.8 min | $0.13, 2.4 min | **$0.76, 4.2 min** |
-
-The delta between the two runs is direct evidence for the design: switching the reviewer from `--sandbox read-only` to `--sandbox workspace-write` (on its own throwaway worktree) made the difference between inspection-only approval and execution-grounded approval — and immediately surfaced a real test bug we wouldn't have caught otherwise.
-
 ## Comparison with existing tools
 
 The multi-CLI / multi-model code-orchestration space is crowded. Honest take on where dialectic fits relative to the field as of May 2026:
@@ -119,8 +108,33 @@ The multi-CLI / multi-model code-orchestration space is crowded. Honest take on 
 
 Dialectic is deliberately narrow where the field is wide. It scopes to 2 CLIs and concentrates on a **per-item protocol where the reviewer can rebut, and where any unresolved dispute is a first-class step rather than a flag**. None of the other tools have a structured per-item defend-then-rebut loop. The honest cost: dialectic is younger, smaller, and has fewer integrations than every tool above except `claude-codex-collab`.
 
+## Head-to-head: dialectic vs solo Claude
+
+To check whether the reviewer actually catches things a single Claude run would miss, I ran the same three prompts through both pipelines — standalone `claude -p` and full dialectic — with the same writer model (Opus 4.7, max thinking), the same git base, and the same prompts.
+
+| Prompt | Solo Claude | Dialectic | Items reviewer raised |
+|---|---|---|---|
+| Add a `dialectic stats` subcommand (contained, well-specified) | $1.04 / 2.7 min | $3.47 / 12.6 min | 0 |
+| Add structured `log_file` + JSONL rotation (design-ambiguous) | $5.63 / 13.3 min | $8.72 / 39 min | **6, across 2 review rounds** |
+| Add a `--last` flag to `dialectic show` (small extension) | $0.89 / 2.4 min | $1.69 / 7.3 min | 0 |
+
+On the two contained prompts, dialectic was honest overhead — solo Claude produced functionally equivalent diffs and the reviewer raised nothing actionable. The reviewer's executed verification (running `pytest`, `git apply --check`, and explicitly addressing every one of the writer's `open_questions`) is real signal, but only worth it if you wouldn't otherwise read the writer's report yourself.
+
+On the design-ambiguous prompt — adding rotating JSONL file logging — **three of the four round-1 critique items were real bugs that solo Claude also shipped in its diff**:
+
+- Rotation timing: `_RotatingHandler.emit` checked size *before* the write, so a single oversized record would leave the file un-rotated.
+- Missing `CURRENT_PROTOCOL_VERSION` bump despite adding a new field (`log_file`) to `RunConfig`.
+- `setLevel(DEBUG)` to attach the file handler also lowered every existing stderr handler's threshold, leaking DEBUG output to the user's terminal.
+
+The fourth item (concurrent runs cross-writing the same file) was already solved in solo Claude's diff via a `contextvars` filter, so doesn't count as a reviewer-vs-solo win.
+
+The honest caveat: round 2 then raised 2 *new* items that were introduced by the round-1 fixes, and the run ended in `AWAITING_ARBITRATION`. So dialectic on design-heavy prompts is *"writer + reviewer iterating, user adjudicates residuals"* — not a clean one-and-done.
+
+Net: dialectic earned its premium where the prompt had architectural ambiguity. On well-specified contained changes, solo Claude is equivalent for less time and money. The README's recommendation in the "[When NOT to use](#when-not-to-use-dialectic)" section reflects this.
+
 ## When NOT to use dialectic
 
+- **Well-specified, single-file changes.** On contained CLI extensions like `dialectic stats` and `dialectic show --last`, the [head-to-head](#head-to-head-dialectic-vs-solo-claude) showed the reviewer raised zero items and dialectic cost 2-3× what solo Claude did. Skip dialectic; you'll get equivalent code from a plain `claude -p`.
 - **Short prompts where speed matters more than scrutiny.** A `claude -p "rename foo to bar"` is 30 seconds. Dialectic adds at least the reviewer's round trip (minimum 2–3 minutes, $0.20+). Not worth it for trivial edits.
 - **Throughput across many tasks.** If you have 50 independent issues to fix in parallel, you want `ComposioHQ/agent-orchestrator` (or similar) and its auto-CI-fix loop. Dialectic processes one prompt at a time on purpose.
 - **Production CI/CD pipelines without a human in the loop.** Dialectic surfaces disputes to you. If "you" is a cron job, the unresolved disputes have nowhere to go. (`--auto-approve` exists but disables the human-arbitration safety; use sparingly.)
